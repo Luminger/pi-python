@@ -27,6 +27,14 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+
+/**
+ * The subset of SessionManager methods the extension actually consumes.
+ * Sourced from ExtensionContext so we don't depend on a non-public type
+ * symbol; lets us call resolveRestorePath() from tests without having to
+ * fabricate the rest of an ExtensionContext.
+ */
+type SessionManagerView = ExtensionContext["sessionManager"];
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -140,13 +148,8 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		kernel = null;
 	};
 
-	const restorePathFor = (ctx: ExtensionContext): string | null => {
-		if (!ctx.sessionManager.getSessionFile()) return null;
-		const sessionId = ctx.sessionManager.getSessionId();
-		const leafId = ctx.sessionManager.getLeafId();
-		if (!sessionId || !leafId) return null;
-		return picklePathFor(sessionId, leafId);
-	};
+	const restorePathFor = (ctx: ExtensionContext): string | null =>
+		resolveRestorePath(ctx.sessionManager);
 
 	const maybeCheckpoint = async (ctx: ExtensionContext): Promise<void> => {
 		if (!kernel?.isAlive()) return;
@@ -473,12 +476,28 @@ export default function pythonExtension(pi: ExtensionAPI) {
 
 				const leafId = ctx.sessionManager.getLeafId();
 				if (leafId) {
-					const path = picklePathFor(sessionId, leafId);
+					const leafPath = picklePathFor(sessionId, leafId);
+					const leafHasOwn = existsSync(leafPath);
 					lines.push(
 						`  active leaf: ${leafId.slice(0, 8)} ${
-							existsSync(path) ? "✓ checkpoint present" : "✗ no checkpoint"
+							leafHasOwn ? "✓ checkpoint present" : "✗ no checkpoint"
 						}`,
 					);
+					// When the active leaf has no checkpoint of its own, the
+					// branch-walk lookup will still find an ancestor pickle. Show
+					// the user which one would actually be loaded so the line above
+					// isn't misleading after /tree navigation.
+					if (!leafHasOwn) {
+						const resolved = restorePathFor(ctx);
+						if (resolved) {
+							const ancestor = leafIdFromPicklePath(resolved);
+							lines.push(
+								`  restore src: ${ancestor.slice(0, 8)} (↑ nearest ancestor on branch)`,
+							);
+						} else {
+							lines.push(`  restore src: (none on branch — fresh namespace)`);
+						}
+					}
 				}
 
 				const branchIds = new Set(ctx.sessionManager.getBranch().map((e) => e.id));
@@ -629,10 +648,26 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		await maybeCheckpoint(ctx);
 	});
 
-	// /tree navigation: kill the kernel so the next call's ensureKernel()
-	// restores from the new branch leaf's checkpoint (if any).
-	pi.on("session_tree", async (_event, _ctx) => {
+	// /tree navigation: kill the current kernel so we don't keep state from
+	// the old branch. If the new branch has a checkpoint reachable on its
+	// ancestry, eagerly respawn + restore so a follow-up /python-repl shows
+	// the right state immediately (rather than waiting for the next agent
+	// `python` call to lazily revive things). When there's nothing to
+	// restore we stay lazy — no point paying Python startup cost for an
+	// empty namespace.
+	pi.on("session_tree", async (_event, ctx) => {
 		await killKernel();
+		// skippedLeaves is keyed by leafId within a single kernel process;
+		// after a kill+respawn old entries are stale.
+		skippedLeaves.clear();
+		const restorePath = restorePathFor(ctx);
+		if (!restorePath) return;
+		try {
+			await ensureKernel(ctx.cwd, restorePath);
+		} catch {
+			// Best-effort. The next agent `python` call will retry through
+			// ensureKernel() and surface any persistent failure there.
+		}
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -663,12 +698,44 @@ function resolveCwd(requested: string | undefined, fallback: string): string {
 	return abs;
 }
 
-function checkpointDirFor(sessionId: string): string {
+export function checkpointDirFor(sessionId: string): string {
 	return join(CHECKPOINT_ROOT, sessionId);
 }
 
-function picklePathFor(sessionId: string, leafId: string): string {
+export function picklePathFor(sessionId: string, leafId: string): string {
 	return join(checkpointDirFor(sessionId), `${leafId}.pkl`);
+}
+
+/**
+ * Walk the session's active branch from leaf back to root and return the
+ * first ancestor whose checkpoint pickle exists on disk, or `null` if no
+ * ancestor is checkpointed (or the session isn't being persisted).
+ *
+ * Exported so tests can drive it against a real SessionManager without
+ * having to assemble a full ExtensionContext.
+ *
+ * Why branch-walk instead of exact-leaf match: pickles are keyed by python
+ * toolResult message id, but the active leaf after `/tree` navigation is
+ * almost always some other entry (an assistant or user message somewhere
+ * on the branch). Walking the branch finds the most recent python
+ * checkpoint reachable from the new leaf.
+ */
+export function resolveRestorePath(
+	sessionManager: SessionManagerView,
+): string | null {
+	if (!sessionManager.getSessionFile()) return null;
+	const sessionId = sessionManager.getSessionId();
+	if (!sessionId) return null;
+	const branch = sessionManager.getBranch();
+	// getBranch() returns root → leaf; iterate in reverse so we pick the
+	// deepest ancestor that has a checkpoint.
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (!entry?.id) continue;
+		const path = picklePathFor(sessionId, entry.id);
+		if (existsSync(path)) return path;
+	}
+	return null;
 }
 
 function leafIdFromPicklePath(path: string): string {

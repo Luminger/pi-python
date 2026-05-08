@@ -88,10 +88,18 @@ namespace and writes it to:
 ~/.pi/pi-python/<sessionId>/<leafId>.pkl
 ```
 
-`<leafId>` is the id of the toolResult message in pi's session tree, so the
-checkpoint is naturally branch-bound: pi's `/fork`, `/clone`, and `/tree`
-navigation all just change which leaf is "current", and the right pickle gets
-restored on the next kernel spawn.
+`<leafId>` is the id of the `python` toolResult message in pi's session
+tree, so the checkpoint is naturally branch-bound: pi's `/fork`, `/clone`,
+and `/tree` navigation all just change which leaf is "current", and the
+right pickle gets restored on the next kernel spawn.
+
+The active leaf after a `/tree` jump is rarely a `python` toolResult
+itself — it's usually an assistant or user message somewhere on the
+branch. So the restore lookup walks the active branch from leaf back to
+root and loads the deepest ancestor that has a checkpoint on disk
+(equivalently: the last `python` call you'd see if you scrolled up from
+the current position). `/python-status` reports the resolved restore
+source when it differs from the active leaf.
 
 * **Pickler** — `dill` is used when importable in the active interpreter
   (covers interactively-defined classes, lambdas, closures), else stdlib
@@ -123,7 +131,12 @@ restored on the next kernel spawn.
   off-branch checkpoints are evicted first. Active-branch checkpoints are
   never evicted.
 * **Restore is automatic** on the next kernel spawn (cold start,
-  `/python-restart`, post-`/tree` navigation). Failures are silent (you keep
+  `/python-restart`, post-`/tree` navigation). The restore target is the
+  deepest ancestor of the active leaf that has a checkpoint on disk, so
+  jumping to a position between two `python` calls picks up state as of
+  the earlier call. `session_tree` also eagerly respawns when an ancestor
+  checkpoint exists so a `/python-repl` opened immediately after time
+  travel sees the restored namespace. Failures are silent (you keep
   going with an empty namespace) but recorded — see `/python-status`.
 * **Switching interpreters discards state**: `python_set_interpreter` does
   not restore from a checkpoint, since cross-interpreter pickle loads
