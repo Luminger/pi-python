@@ -27,7 +27,20 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PythonKernel } from "./kernel.ts";
-import { picklePathFor, resolveRestorePath } from "./index.ts";
+import {
+	checkpointDirFor,
+	inheritParentCheckpoints,
+	picklePathFor,
+	resolveRestorePath,
+} from "./index.ts";
+
+// All session ids the test creates; their pickle dirs under PI_PYTHON_DIR
+// (~/.pi/pi-python/) get rmSync'd in the cleanup block so we don't leak
+// state between runs. The test session lifecycle and the on-disk pickle
+// dir lifecycle are decoupled by design (so checkpoints survive a pi
+// crash) — in production that's correct, but for tests it means we have
+// to clean up explicitly.
+const createdSessionIds: string[] = [];
 
 // ─── tiny test harness ──────────────────────────────────────────────────────
 
@@ -151,7 +164,22 @@ async function probeRestore(
 // ─── the actual test ────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-	const tmpRoot = mkdtempSync(join(tmpdir(), "pi-python-test-"));
+	let tmpRoot: string | null = null;
+	try {
+		tmpRoot = mkdtempSync(join(tmpdir(), "pi-python-test-"));
+		await runScenarios(tmpRoot);
+	} finally {
+		// Always tear down checkpoint dirs we created, even on assertion
+		// failure or thrown error — otherwise repeated test runs leak dirs
+		// under ~/.pi/pi-python/.
+		if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true });
+		for (const sid of createdSessionIds) {
+			rmSync(checkpointDirFor(sid), { recursive: true, force: true });
+		}
+	}
+}
+
+async function runScenarios(tmpRoot: string): Promise<void> {
 	const sessionDir = join(tmpRoot, "sessions");
 
 	console.log(`tmp root: ${tmpRoot}`);
@@ -159,6 +187,7 @@ async function main(): Promise<void> {
 	const sm = SessionManager.create(tmpRoot, sessionDir);
 	const sessionId = sm.getSessionId();
 	if (!sessionId) throw new Error("session id is null");
+	createdSessionIds.push(sessionId);
 	console.log(`session id: ${sessionId}`);
 
 	// Spawn a kernel we'll reuse for writing checkpoints. Each scenario's
@@ -304,8 +333,139 @@ async function main(): Promise<void> {
 		assertEq(r.probeValue, "'beta'", "marker == beta");
 	}
 
-	// ─── Cleanup ─────────────────────────────────────────────────────────────
-	rmSync(tmpRoot, { recursive: true, force: true });
+	// ─── Scenario 8: branchWithSummary — leaf is the synthetic summary ───────
+	// branchWithSummary(asst1b, "…") moves the leaf to asst1b and appends a
+	// branch_summary entry as its child; the summary entry becomes the new
+	// leaf. The summary entry is non-message and has no pickle of its own,
+	// so the walk should skip past it to asst1b (also no pickle) and land
+	// on tr1's α checkpoint.
+	console.log("\n[8] leaf is a branch_summary entry from /branch-with-summary");
+	const summaryId = sm.branchWithSummary(asst1b, "moved on from the original path");
+	console.log(`  branch summary entry: ${summaryId}`);
+	{
+		const branchIds = sm.getBranch().map((e) => e.id);
+		assertEq(
+			branchIds.includes(summaryId) && branchIds[branchIds.length - 1] === summaryId,
+			true,
+			"summary entry is the active leaf and appears in getBranch()",
+		);
+		const r = await probeRestore(sm, "step_marker");
+		assertEq(r.resolvedLeaf, tr1, "walk skips branch_summary, lands on tr1");
+		assertEq(r.probeValue, "'alpha'", "marker == alpha");
+	}
+
+	// ─── Scenario 9: python call appended after a branch_summary ─────────────
+	// Verify the new toolResult's pickle is found correctly even though its
+	// parent on the branch is a branch_summary entry rather than a normal
+	// assistant/user message.
+	console.log("\n[9] python call appended after a branch_summary");
+	const userPost = appendUser(sm, "after the summary, do a fresh python call");
+	const asstPost = appendAssistantToolCall(sm, "running", "tc-post", "python", { cells: [{ code: "x=5" }] });
+	const trPost = appendToolResult(sm, "tc-post", "python", "ok");
+	{
+		const writer3 = new PythonKernel({ pythonPath: "python3", cwd: process.cwd() });
+		await writer3.start();
+		try {
+			await exec(writer3, `step_marker = "epsilon"`);
+			const result = await writer3.checkpoint(picklePathFor(sessionId, trPost));
+			if (!result.ok) throw new Error(`checkpoint failed: ${result.reason}`);
+		} finally {
+			await writer3.shutdown();
+		}
+	}
+	{
+		const r = await probeRestore(sm, "step_marker");
+		assertEq(r.resolvedLeaf, trPost, "new tip wins on the post-summary path");
+		assertEq(r.probeValue, "'epsilon'", "marker == epsilon");
+	}
+
+	// ─── Scenario 10: forkFrom() into a fresh project, inherit pickles ─────
+	// SessionManager.forkFrom copies *all* entries from the source verbatim
+	// (preserving entry ids) and the new manager opens with the file's
+	// trailing entry as its leaf — it does NOT carry over the parent's
+	// runtime leaf. So to simulate "user forked from tr2" we explicitly
+	// re-position the fork's leaf to tr2 after forkFrom, then run
+	// inheritance. Inheritance walks the fork's active branch and copies
+	// any parent pickle whose key matches an entry on that branch.
+	console.log("\n[10] forkFrom + branch(tr2) — alpha + beta inherit");
+	const parentSessionFile = sm.getSessionFile()!;
+	const forkCwd = join(tmpRoot, "forked-cwd");
+	const forkSessionDir = join(forkCwd, "sessions");
+	const smFork = SessionManager.forkFrom(parentSessionFile, forkCwd, forkSessionDir);
+	const forkSessionId = smFork.getSessionId()!;
+	createdSessionIds.push(forkSessionId);
+	console.log(`  fork session id: ${forkSessionId}`);
+	assertEq(forkSessionId !== sessionId, true, "fork has a different session id");
+	assertEq(
+		existsSync(checkpointDirFor(forkSessionId)),
+		false,
+		"fork checkpoint dir is empty pre-inherit",
+	);
+	smFork.branch(tr2);
+	const inherited = inheritParentCheckpoints(smFork);
+	assertEq(inherited?.parentSessionId, sessionId, "inheritance reports correct parent id");
+	// alpha (on path) + beta (on path) = 2 inherited.
+	assertEq(inherited?.copied, 2, "copied 2 pickles (alpha + beta) from parent");
+	assertEq(
+		existsSync(picklePathFor(forkSessionId, tr1)),
+		true,
+		"α pickle landed in fork dir",
+	);
+	assertEq(
+		existsSync(picklePathFor(forkSessionId, tr2)),
+		true,
+		"β pickle landed in fork dir",
+	);
+	// Off-branch parent pickles must NOT come along: trPost (epsilon) is
+	// past tr2 in the file but not in the tr2-rooted branch.
+	assertEq(
+		existsSync(picklePathFor(forkSessionId, trPost)),
+		false,
+		"off-branch ε pickle did NOT land in fork dir",
+	);
+	{
+		const r = await probeRestore(smFork, "step_marker");
+		assertEq(r.resolvedLeaf, tr2, "fork resolves to inherited β pickle");
+		assertEq(r.probeValue, "'beta'", "fork kernel shows marker == beta");
+	}
+
+	// ─── Scenario 11: forkFrom + position at tr1 — only α inherits ───────
+	console.log("\n[11] forkFrom + branch(tr1) — only ancestor pickles copy");
+	const forkCwd2 = join(tmpRoot, "forked-cwd-2");
+	const smFork2 = SessionManager.forkFrom(parentSessionFile, forkCwd2, join(forkCwd2, "sessions"));
+	const forkSessionId2 = smFork2.getSessionId()!;
+	createdSessionIds.push(forkSessionId2);
+	smFork2.branch(tr1);
+	const inherited2 = inheritParentCheckpoints(smFork2);
+	assertEq(inherited2?.parentSessionId, sessionId, "fork2 sees correct parent");
+	assertEq(
+		inherited2?.copied,
+		1,
+		"only α inherits when fork's branch stops at tr1",
+	);
+	assertEq(
+		existsSync(picklePathFor(forkSessionId2, tr1)),
+		true,
+		"α pickle landed in fork2 dir",
+	);
+	assertEq(
+		existsSync(picklePathFor(forkSessionId2, tr2)),
+		false,
+		"β pickle did NOT land in fork2 dir (off-branch)",
+	);
+
+	// ─── Scenario 12: inheritance is idempotent — second call is a no-op ───
+	console.log("\n[12] inheritance is idempotent");
+	const inheritedAgain = inheritParentCheckpoints(smFork);
+	assertEq(
+		inheritedAgain?.copied,
+		0,
+		"second inherit copies 0 (existing files never clobbered)",
+	);
+
+	// ─── Scenario 13: no parent (regular non-forked session) ───────────────
+	console.log("\n[13] non-forked session: inheritance no-ops");
+	assertEq(inheritParentCheckpoints(sm), null, "plain session reports no inheritance");
 
 	console.log("");
 	console.log(`══ ${passed} passed · ${failed} failed ══`);

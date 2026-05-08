@@ -43,7 +43,7 @@ import {
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import {
@@ -88,6 +88,16 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				keysRestored: number;
 				keysFailed: number;
 				durationMs: number;
+				ts: number;
+		  }
+		| null = null;
+	// Records the most recent fork-inheritance copy (parent session id +
+	// number of pickles inherited). Surfaced in /python-status so users can
+	// confirm a fresh fork picked up the parent's checkpoints.
+	let lastInherit:
+		| {
+				parentSessionId: string;
+				copied: number;
 				ts: number;
 		  }
 		| null = null;
@@ -474,6 +484,13 @@ export default function pythonExtension(pi: ExtensionAPI) {
 					);
 				}
 
+				if (lastInherit) {
+					const ageS = Math.max(0, Math.round((Date.now() - lastInherit.ts) / 1000));
+					lines.push(
+						`  inherited:  ${lastInherit.copied} from parent ${lastInherit.parentSessionId.slice(0, 8)}, ${ageS}s ago`,
+					);
+				}
+
 				const leafId = ctx.sessionManager.getLeafId();
 				if (leafId) {
 					const leafPath = picklePathFor(sessionId, leafId);
@@ -600,6 +617,31 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				ctx.ui.setStatus("pi-python", "");
 			}
 		},
+	});
+
+	// Fork inheritance: when this session was forked from another, copy the
+	// parent's per-leaf checkpoint pickles into this session's dir for any
+	// entry id on the active branch. Because /fork preserves entry ids
+	// verbatim (see SessionManager.forkFrom and createBranchedSession), a
+	// pickle keyed by entry id X in the parent is a valid pickle for entry
+	// id X in the fork. The branch-walk lookup then resolves to it on the
+	// next ensureKernel(), exactly like a non-forked session would.
+	pi.on("session_start", async (event, ctx) => {
+		if (event.reason !== "fork") return;
+		const result = inheritParentCheckpoints(ctx.sessionManager);
+		if (!result) return;
+		lastInherit = {
+			parentSessionId: result.parentSessionId,
+			copied: result.copied,
+			ts: Date.now(),
+		};
+		if (result.copied > 0) {
+			ctx.ui.notify(
+				`pi-python: inherited ${result.copied} checkpoint${result.copied === 1 ? "" : "s"} ` +
+					`from parent session ${result.parentSessionId.slice(0, 8)}`,
+				"info",
+			);
+		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -736,6 +778,73 @@ export function resolveRestorePath(
 		if (existsSync(path)) return path;
 	}
 	return null;
+}
+
+/** Read just the session id out of a session file's header line. Returns
+ * null if the file is missing, empty, or doesn't start with a valid
+ * session header. Cheap — reads only the first line. */
+export function readSessionIdFromFile(filePath: string): string | null {
+	let content: string;
+	try {
+		content = readFileSync(filePath, { encoding: "utf8" });
+	} catch {
+		return null;
+	}
+	const firstLine = content.split("\n", 1)[0];
+	if (!firstLine) return null;
+	try {
+		const obj = JSON.parse(firstLine) as { type?: string; id?: string };
+		if (obj.type !== "session") return null;
+		return typeof obj.id === "string" ? obj.id : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Copy any parent-session pickles whose leaf id appears on the new (fork)
+ * session's active branch into the new session's checkpoint dir.
+ *
+ * Safe to call on every session_start — returns null if there's no parent
+ * to inherit from. Existing pickles in the destination are never
+ * overwritten, so a re-run of this function (e.g. after `/python-status`)
+ * is idempotent.
+ *
+ * Returns the parent session id and number of pickles actually copied, or
+ * null if no inheritance was attempted (no parent, parent file missing,
+ * etc.). Exported for testing.
+ */
+export function inheritParentCheckpoints(
+	sessionManager: SessionManagerView,
+): { parentSessionId: string; copied: number } | null {
+	const newSessionId = sessionManager.getSessionId();
+	if (!newSessionId) return null;
+	const header = sessionManager.getHeader();
+	const parentPath = header?.parentSession;
+	if (!parentPath) return null;
+	const parentSessionId = readSessionIdFromFile(parentPath);
+	if (!parentSessionId || parentSessionId === newSessionId) return null;
+	const parentDir = checkpointDirFor(parentSessionId);
+	if (!existsSync(parentDir)) return { parentSessionId, copied: 0 };
+
+	const branch = sessionManager.getBranch();
+	const newDir = checkpointDirFor(newSessionId);
+	let copied = 0;
+	for (const entry of branch) {
+		if (!entry?.id) continue;
+		const parentPickle = picklePathFor(parentSessionId, entry.id);
+		if (!existsSync(parentPickle)) continue;
+		const targetPickle = picklePathFor(newSessionId, entry.id);
+		if (existsSync(targetPickle)) continue; // never clobber
+		if (copied === 0) mkdirSync(newDir, { recursive: true });
+		try {
+			copyFileSync(parentPickle, targetPickle);
+			copied++;
+		} catch {
+			// best-effort — a single failed copy shouldn't block the others
+		}
+	}
+	return { parentSessionId, copied };
 }
 
 function leafIdFromPicklePath(path: string): string {

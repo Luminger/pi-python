@@ -138,6 +138,16 @@ source when it differs from the active leaf.
   checkpoint exists so a `/python-repl` opened immediately after time
   travel sees the restored namespace. Failures are silent (you keep
   going with an empty namespace) but recorded — see `/python-status`.
+* **Forks inherit parent checkpoints.** When a session was forked from
+  another (`SessionHeader.parentSession` is set) the `session_start`
+  hook walks the fork's active branch and copies any of the parent's
+  pickles whose key matches an entry on that branch into the fork's own
+  checkpoint dir. Because pi's fork preserves entry ids verbatim, the
+  copied pickle is a valid checkpoint for the fork's same-id entry.
+  Existing files in the fork dir are never overwritten, so the operation
+  is idempotent. `/python-status` shows how many pickles were inherited
+  on the most recent fork. Off-branch parent pickles aren't copied; if
+  you fork from `tr1` you don't inherit `tr2`'s namespace.
 * **Switching interpreters discards state**: `python_set_interpreter` does
   not restore from a checkpoint, since cross-interpreter pickle loads
   typically fail.
@@ -274,8 +284,6 @@ runnable interpreter.
   next time you open it and they don't trigger their own checkpoints. The
   next `python` tool call's checkpoint will still capture any state you
   left behind. Fixing this is the planned next iteration.
-* **Forked sessions don't inherit parent checkpoints.** A `/fork` starts
-  with a fresh kernel; the parent's pickles aren't pulled forward.
 * **Orphaned checkpoint dirs.** When a pi session is deleted, its
   `~/.pi/pi-python/<sessionId>/` dir stays behind. No automatic cleanup
   yet.
