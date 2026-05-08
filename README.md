@@ -1,12 +1,12 @@
 # pi-python
 
-A pi extension that gives the agent a persistent Python execution environment,
-plus an interactive Python REPL the user can drop into mid-conversation that
-shares the same kernel.
+A pi extension that gives the agent a persistent Python execution
+environment.
 
-Spawns one long-lived `python3 -u` subprocess per pi session, lazily on first
-use. State is checkpointed to disk after every successful cell so kernel
-restarts (and `/tree` navigation) preserve variables, imports, and definitions.
+Spawns one long-lived `python3 -u` subprocess per pi session, lazily on
+first use. State is checkpointed to disk after every successful cell so
+kernel restarts (and `/tree` navigation, including time travel and forks)
+preserve variables, imports, and definitions.
 
 ## Tools the agent sees
 
@@ -19,18 +19,17 @@ Both tools are registered with `executionMode: "sequential"` so the agent
 never tries to run two cells (or a cell and an interpreter switch)
 concurrently against the same kernel.
 
-There is intentionally **no** `python_reset` tool. If the agent needs a clean
-namespace it can call `python_set_interpreter` with the same path (which
-discards state by design), run `globals().clear()` in a cell, or ask the user
-to `/python-restart`.
+There is intentionally **no** `python_reset` tool. If the agent needs a
+clean namespace it can call `python_set_interpreter` with the same path
+(which discards state by design), run `globals().clear()` in a cell, or
+ask the user to `/python-restart`.
 
 ## Slash commands the user sees
 
 | Command | What it does |
 | ------- | ------------ |
-| `/python-status` | Kernel info (executable, pid, pickler) + checkpoint stats (count, total size, latest, branch coverage) + active settings with their source. |
-| `/python-restart` | Kill and respawn the kernel — interrupts a hung cell — then automatically restore the latest on-disk checkpoint for the current branch leaf. State up through the last successful cell is preserved. |
-| `/python-repl` | Drop into an interactive Python shell that drives the **same** kernel the agent uses. Multi-line input via `... ` continuation (using `codeop.compile_command`, the same primitive Python's own REPL uses), `↑`/`↓` history, `Ctrl+C` interrupt, `Esc` / `Ctrl+D` / `:q` to exit. Variables you define are visible to the agent on its next `python` call (and vice versa). |
+| `/python-status` | Kernel info (executable, pid, pickler) + checkpoint stats (count, total size, latest, branch coverage, fork inheritance) + active settings with their source. |
+| `/python-restart` | Kill and respawn the kernel — interrupts a hung cell — then automatically restore the latest on-disk checkpoint reachable from the current branch leaf. State up through the last successful cell is preserved. |
 
 ## CLI flags
 
@@ -48,9 +47,8 @@ to `/python-restart`.
 ┌──────────────┐   NDJSON over stdio   ┌──────────────────┐
 │  pi (host)   │  ──────────────────▶  │  python3 runner  │
 │  index.ts    │  ◀──────────────────  │  runner.py       │
-│  kernel.ts   │     stream events      │  (persistent ns) │
-│  repl.ts     │                        └──────────────────┘
-│  settings.ts │
+│  kernel.ts   │     stream events     │  (persistent ns) │
+│  settings.ts │                       └──────────────────┘
 └──────────────┘
        │
        └─── ~/.pi/pi-python/<sessionId>/<leafId>.pkl
@@ -58,30 +56,29 @@ to `/python-restart`.
 ```
 
 * **`runner.py`** — Python subprocess that reads NDJSON requests on stdin
-  (`execute`, `compile_check`, `checkpoint`, `restore`) and emits framed
-  events on stdout. User code that prints is captured by replacing
-  `sys.stdout` / `sys.stderr` with stream writers; control messages always
-  go through `sys.__stdout__`.
+  (`execute`, `checkpoint`, `restore`) and emits framed events on stdout.
+  User code that prints is captured by replacing `sys.stdout` /
+  `sys.stderr` with stream writers; control messages always go through
+  `sys.__stdout__`.
 * **`kernel.ts`** — Owns the subprocess. Parses the NDJSON stream, supports
   cancellation via `SIGINT`, respawns after a hard kill, exposes typed
-  `execute()` / `checkSyntax()` / `checkpoint()` / `restore()` methods, and
-  validates interpreter paths.
-* **`repl.ts`** — `ctx.ui.custom()` TUI component: scrollback + single-line
-  `Input` prompt + `... ` continuation driven by `compile_check` calls.
-* **`settings.ts`** — Loader for `pi-python/settings.json` (global + project)
-  and the `PI_PYTHON_*` env vars.
+  `execute()` / `checkpoint()` / `restore()` methods, and validates
+  interpreter paths.
+* **`settings.ts`** — Loader for `pi-python/settings.json` (global +
+  project) and the `PI_PYTHON_*` env vars.
 * **`index.ts`** — Glue: registers the tools and slash commands, owns the
   single kernel reference, hooks `message_end` for auto-checkpoint, hooks
-  `session_tree` to kill the kernel for branch-restore, and tears down on
+  `session_tree` to kill the kernel for branch-restore, hooks
+  `session_start` for fork checkpoint inheritance, and tears down on
   `session_shutdown`.
 
 Cells inside one `python` call run sequentially; if a cell raises, later
-cells are skipped (Jupyter notebook semantics). The trailing expression of a
-cell, if any, has its `repr()` shown — same as a notebook cell.
+cells are skipped (Jupyter notebook semantics). The trailing expression
+of a cell, if any, has its `repr()` shown — same as a notebook cell.
 
 ## Checkpoints
 
-After every successful `python` tool call, the runner pickles the kernel
+After every successful `python` tool call the runner pickles the kernel
 namespace and writes it to:
 
 ```
@@ -89,9 +86,9 @@ namespace and writes it to:
 ```
 
 `<leafId>` is the id of the `python` toolResult message in pi's session
-tree, so the checkpoint is naturally branch-bound: pi's `/fork`, `/clone`,
-and `/tree` navigation all just change which leaf is "current", and the
-right pickle gets restored on the next kernel spawn.
+tree, so the checkpoint is naturally branch-bound: pi's `/fork`,
+`/clone`, and `/tree` navigation all just change which leaf is "current",
+and the right pickle gets restored on the next kernel spawn.
 
 The active leaf after a `/tree` jump is rarely a `python` toolResult
 itself — it's usually an assistant or user message somewhere on the
@@ -117,27 +114,25 @@ source when it differs from the active leaf.
   ```
 
   The pickler is decided once at kernel startup, so after installing dill
-  run `/python-restart` (or wait for the next spawn) to pick it up. The
-  REPL shares the kernel with the agent's `python` tool, so both see the
-  same pickler.
-* **Per-key best-effort** — values that can't be pickled (open file handles,
-  most ML model objects, lambdas without dill) are skipped individually
-  rather than failing the whole checkpoint. Skipped names appear in
-  `/python-status`.
-* **Size cap** — pickles bigger than `pickleMaxBytes` (default 256 MB) are
-  written to nothing and the leaf is marked "skipped" for the session so we
-  don't keep retrying. Surface in `/python-status`.
-* **Eviction** — at most 20 checkpoints per session are kept on disk; older
-  off-branch checkpoints are evicted first. Active-branch checkpoints are
-  never evicted.
+  run `/python-restart` (or wait for the next spawn) to pick it up.
+* **Per-key best-effort** — values that can't be pickled (open file
+  handles, most ML model objects, lambdas without dill) are skipped
+  individually rather than failing the whole checkpoint. Skipped names
+  appear in `/python-status`.
+* **Size cap** — pickles bigger than `pickleMaxBytes` (default 256 MB)
+  are written to nothing and the leaf is marked "skipped" for the
+  session so we don't keep retrying. Surfaced in `/python-status`.
+* **Eviction** — at most 20 checkpoints per session are kept on disk;
+  older off-branch checkpoints are evicted first. Active-branch
+  checkpoints are never evicted.
 * **Restore is automatic** on the next kernel spawn (cold start,
   `/python-restart`, post-`/tree` navigation). The restore target is the
   deepest ancestor of the active leaf that has a checkpoint on disk, so
   jumping to a position between two `python` calls picks up state as of
-  the earlier call. `session_tree` also eagerly respawns when an ancestor
-  checkpoint exists so a `/python-repl` opened immediately after time
-  travel sees the restored namespace. Failures are silent (you keep
-  going with an empty namespace) but recorded — see `/python-status`.
+  the earlier call. `session_tree` also eagerly respawns when an
+  ancestor checkpoint exists so the next agent `python` call doesn't pay
+  Python startup + unpickle latency. Failures are silent (you keep going
+  with an empty namespace) but recorded — see `/python-status`.
 * **Forks inherit parent checkpoints.** When a session was forked from
   another (`SessionHeader.parentSession` is set) the `session_start`
   hook walks the fork's active branch and copies any of the parent's
@@ -148,14 +143,14 @@ source when it differs from the active leaf.
   is idempotent. `/python-status` shows how many pickles were inherited
   on the most recent fork. Off-branch parent pickles aren't copied; if
   you fork from `tr1` you don't inherit `tr2`'s namespace.
-* **Switching interpreters discards state**: `python_set_interpreter` does
-  not restore from a checkpoint, since cross-interpreter pickle loads
-  typically fail.
+* **Switching interpreters discards state**: `python_set_interpreter`
+  does not restore from a checkpoint, since cross-interpreter pickle
+  loads typically fail.
 
 ## Settings
 
-`pi-python` reads its own JSON settings file from two locations, mirroring
-pi's own settings.json layout:
+`pi-python` reads its own JSON settings file from two locations,
+mirroring pi's own settings.json layout:
 
 ```
 ~/.pi/pi-python/settings.json          (global)
@@ -173,8 +168,8 @@ source. Schema:
 }
 ```
 
-Precedence (highest wins): env var → project file → global file → built-in
-default.
+Precedence (highest wins): env var → project file → global file →
+built-in default.
 
 ### Environment variable overrides
 
@@ -195,22 +190,24 @@ In order of priority:
 6. `python3` on `PATH`
 
 `python_set_interpreter` and the `--python` flag both accept either an
-absolute path to a binary or a bare command name on `PATH`. Directories are
-rejected with a hint pointing at the binary path inside.
+absolute path to a binary or a bare command name on `PATH`. Directories
+are rejected with a hint pointing at the binary path inside.
 
-API-key-shaped env vars (`OPENAI_*`, `ANTHROPIC_*`, `*_API_KEY`, `*_TOKEN`,
-`*_SECRET`, etc.) are stripped from the subprocess env so LLM-generated code
-that reads `os.environ` can't exfiltrate them.
+API-key-shaped env vars (`OPENAI_*`, `ANTHROPIC_*`, `*_API_KEY`,
+`*_TOKEN`, `*_SECRET`, etc.) are stripped from the subprocess env so
+LLM-generated code that reads `os.environ` can't exfiltrate them.
 
 ## Install
 
 The repo doubles as the extension package, so `npm install` here pulls in
-the typings and dev tooling, and `npm run check` typechecks all four TS
-files:
+the typings and dev tooling, and `npm run check` typechecks the TS
+files. `npm test` runs the end-to-end checkpoint/restore test suite (no
+mocks; uses real `SessionManager` + real `PythonKernel`).
 
 ```bash
 npm install
 npm run check
+npm test
 ```
 
 For pi to pick the extension up, place this directory under one of pi's
@@ -225,9 +222,10 @@ mkdir -p .pi/extensions
 ln -s "$(pwd)" .pi/extensions/pi-python
 ```
 
-Then `/reload` inside pi (or restart). `/python-status` will confirm it's
-loaded. The `--python <path>` flag in `pi --help` is also a quick check —
-it's registered by this extension, so its presence means pi-python loaded.
+Then `/reload` inside pi (or restart). `/python-status` will confirm
+it's loaded. The `--python <path>` flag in `pi --help` is also a quick
+check — it's registered by this extension, so its presence means
+pi-python loaded.
 
 For one-off testing without installing:
 
@@ -263,32 +261,27 @@ sees the most recent output when runs are noisy.
 
 Validates the path, kills the current kernel, spawns a new one with the
 requested interpreter, and reports the resolved executable, version, and
-new pid. Throws (with the validation error) if the path doesn't point at a
-runnable interpreter.
+new pid. Throws (with the validation error) if the path doesn't point at
+a runnable interpreter.
 
 ## Known limitations
 
 * **No rich display** — only text stdout/stderr and `repr()` of trailing
   expressions. No `image/png` / `text/markdown` envelopes (yet).
-* **`input()` is not supported** — there is no interactive stdin. Pass data
-  through variables instead.
+* **`input()` is not supported** — there is no interactive stdin. Pass
+  data through variables instead.
 * **`subprocess` output via raw fd 1** — `subprocess.run(...,
-  capture_output=True)` works, but child processes that write directly to
-  fd 1 bypass our `sys.stdout` shadowing.
+  capture_output=True)` works, but child processes that write directly
+  to fd 1 bypass our `sys.stdout` shadowing.
 * **One kernel per pi process** — no shared gateway across multiple pi
   instances. If you need that, the next step is binding the kernel to a
   Unix socket per session file.
-* **REPL submissions aren't tree-bound yet** — cells you run via
-  `/python-repl` execute against the kernel but aren't persisted as
-  session entries, so they don't appear in `/python-repl` scrollback the
-  next time you open it and they don't trigger their own checkpoints. The
-  next `python` tool call's checkpoint will still capture any state you
-  left behind. Fixing this is the planned next iteration.
-* **Orphaned checkpoint dirs.** When a pi session is deleted, its
+* **Orphaned checkpoint dirs** — when a pi session is deleted, its
   `~/.pi/pi-python/<sessionId>/` dir stays behind. No automatic cleanup
   yet.
 
 The architecture is borrowed in spirit from
 [oh-my-pi's IPython kernel runtime](https://github.com/can1357/oh-my-pi/blob/main/docs/python-repl.md),
 with the heavy Jupyter Kernel Gateway replaced by a stdio NDJSON protocol
-so this works with a stock Python install.
+so this works with a stock Python install. (oh-my-pi's runtime offers an
+interactive REPL too; pi-python intentionally does not.)

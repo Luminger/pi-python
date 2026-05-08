@@ -20,10 +20,6 @@ are supported, distinguished by the optional `type` field (default "execute").
         "cwd": "/abs/path"         # optional
     }
 
-    # type: "compile_check" — ask whether `code` is a complete Python
-    # statement using codeop.compile_command.
-    {"id": "...", "type": "compile_check", "code": "..."}
-
     # type: "checkpoint" — pickle the current namespace to `path`.
     # Writes are skipped (with reason) when the resulting blob would exceed
     # `max_bytes` (default 256 MB). Best-effort per-key: unpicklable values
@@ -40,9 +36,6 @@ Response (runner -> host), one JSON object per line:
         "value":"<repr-or-empty>",
         "exception":"<traceback-or-empty>"}
     {"id","type":"done","cells_run":N,"reset":bool}
-    {"id","type":"compile_check_result",
-        "status":"complete"|"incomplete"|"error",
-        "error":"<message-or-empty>"}
     {"id","type":"checkpoint_result",
         "ok":bool,
         "skipped":bool, "reason":"<text>",
@@ -62,7 +55,6 @@ sys.stdout / sys.stderr stays cleanly separated from control messages.
 from __future__ import annotations
 
 import ast
-import codeop
 import json
 import os
 import sys
@@ -75,8 +67,8 @@ _RAW_STDOUT = sys.__stdout__
 
 # Pick the best available serializer once at startup. dill handles
 # interactively-defined functions, classes, lambdas, and closures — the
-# common case in a REPL/notebook. Fall back to stdlib pickle if dill isn't
-# present so the runner stays usable on a bare interpreter.
+# common case in a notebook-style cell loop. Fall back to stdlib pickle if
+# dill isn't present so the runner stays usable on a bare interpreter.
 try:
     import dill as _pickler  # type: ignore[import-not-found]
 
@@ -198,53 +190,8 @@ def _run_cell(ns: dict[str, Any], code: str) -> tuple[bool, str, str]:
         return False, "", traceback.format_exc()
 
 
-def _handle_compile_check(msg: dict[str, Any]) -> None:
-    request_id = msg.get("id", "")
-    code = msg.get("code", "")
-    if not isinstance(code, str):
-        _emit(
-            {
-                "id": request_id,
-                "type": "compile_check_result",
-                "status": "error",
-                "error": "code must be a string",
-            }
-        )
-        return
-
-    # codeop.compile_command:
-    #   - returns a code object when the buffer is a complete statement
-    #   - returns None when the buffer looks like the start of a multi-line
-    #     statement (e.g. `def foo():` with no body yet)
-    #   - raises SyntaxError / OverflowError / ValueError on a real error
-    try:
-        result = codeop.compile_command(code, "<pi-python repl>", "single")
-    except (SyntaxError, OverflowError, ValueError) as exc:
-        _emit(
-            {
-                "id": request_id,
-                "type": "compile_check_result",
-                "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        return
-
-    _emit(
-        {
-            "id": request_id,
-            "type": "compile_check_result",
-            "status": "complete" if result is not None else "incomplete",
-            "error": "",
-        }
-    )
-
-
 def _handle_request(state: dict[str, Any], msg: dict[str, Any]) -> None:
     kind = msg.get("type", "execute")
-    if kind == "compile_check":
-        _handle_compile_check(msg)
-        return
     if kind == "checkpoint":
         _handle_checkpoint(state, msg)
         return

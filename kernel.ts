@@ -92,13 +92,6 @@ interface PendingRequest {
 	onUpdate?: (snapshot: ExecuteResult) => void;
 }
 
-export type CompileStatus = "complete" | "incomplete" | "error";
-
-export interface CompileCheckResult {
-	status: CompileStatus;
-	error: string;
-}
-
 export interface CheckpointResult {
 	ok: boolean;
 	skipped: boolean;
@@ -119,7 +112,7 @@ export interface RestoreResult {
 	durationMs: number;
 }
 
-/** Generic single-shot RPC awaiter, used for compile_check / checkpoint / restore. */
+/** Generic single-shot RPC awaiter, used for checkpoint / restore. */
 interface PendingRpc {
 	resolve: (msg: Record<string, unknown>) => void;
 	reject: (err: Error) => void;
@@ -270,11 +263,7 @@ export class PythonKernel {
 			return;
 		}
 
-		if (
-			type === "compile_check_result" ||
-			type === "checkpoint_result" ||
-			type === "restore_result"
-		) {
+		if (type === "checkpoint_result" || type === "restore_result") {
 			const id = String(msg.id ?? "");
 			const rpc = this.pendingRpc.get(id);
 			if (!rpc) return;
@@ -498,21 +487,6 @@ export class PythonKernel {
 			throw err instanceof Error ? err : new Error(String(err));
 		}
 		return promise;
-	}
-
-	/**
-	 * Ask the runner whether `code` is a complete Python statement.
-	 * Used by the REPL component to know when to switch the prompt to `... `.
-	 */
-	async checkSyntax(code: string): Promise<CompileCheckResult> {
-		const msg = await this.sendRpc("chk", "compile_check_result", {
-			type: "compile_check",
-			code,
-		});
-		return {
-			status: (msg.status as CompileStatus) ?? "error",
-			error: String(msg.error ?? ""),
-		};
 	}
 
 	/** Ask the runner to pickle the current namespace to `path`. */

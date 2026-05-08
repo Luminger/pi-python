@@ -11,8 +11,6 @@
  *                       on-disk checkpoint so namespace state up through the
  *                       last successful cell is preserved. Use when a cell
  *                       hangs or the kernel is wedged.
- *   - /python-repl    : drop into an interactive Python shell that shares the
- *                       same kernel (and therefore variables) the agent uses
  *
  * CLI flags:
  *   --python <path>   : override the interpreter used for new kernels
@@ -54,7 +52,6 @@ import {
 	validateInterpreterPath,
 	verifyInterpreterRuns,
 } from "./kernel.ts";
-import { PythonReplComponent } from "./repl.ts";
 import { loadSettings, PI_PYTHON_DIR } from "./settings.ts";
 
 const DEFAULT_TIMEOUT_S = 120;
@@ -587,38 +584,6 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("python-repl", {
-		description:
-			"Drop into an interactive Python shell sharing the kernel the agent uses",
-		handler: async (_args, ctx) => {
-			let k: PythonKernel;
-			try {
-				k = await ensureKernel(ctx.cwd, restorePathFor(ctx));
-			} catch (err) {
-				ctx.ui.notify(
-					`pi-python: failed to start kernel: ${err instanceof Error ? err.message : String(err)}`,
-					"error",
-				);
-				return;
-			}
-
-			ctx.ui.setStatus("pi-python", "REPL");
-			try {
-				await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-					return new PythonReplComponent({
-						kernel: k,
-						tui,
-						theme,
-						cwd: ctx.cwd,
-						onDone: () => done(undefined),
-					});
-				});
-			} finally {
-				ctx.ui.setStatus("pi-python", "");
-			}
-		},
-	});
-
 	// Fork inheritance: when this session was forked from another, copy the
 	// parent's per-leaf checkpoint pickles into this session's dir for any
 	// entry id on the active branch. Because /fork preserves entry ids
@@ -692,11 +657,11 @@ export default function pythonExtension(pi: ExtensionAPI) {
 
 	// /tree navigation: kill the current kernel so we don't keep state from
 	// the old branch. If the new branch has a checkpoint reachable on its
-	// ancestry, eagerly respawn + restore so a follow-up /python-repl shows
-	// the right state immediately (rather than waiting for the next agent
-	// `python` call to lazily revive things). When there's nothing to
-	// restore we stay lazy — no point paying Python startup cost for an
-	// empty namespace.
+	// ancestry, eagerly respawn + restore so the next agent `python` call
+	// doesn't pay Python startup + unpickle latency, and any restore
+	// failure surfaces in /python-status immediately rather than mid-tool.
+	// When there's nothing to restore we stay lazy — no point paying Python
+	// startup cost for an empty namespace.
 	pi.on("session_tree", async (_event, ctx) => {
 		await killKernel();
 		// skippedLeaves is keyed by leafId within a single kernel process;

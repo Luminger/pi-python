@@ -11,5 +11,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "kernel.ts", "repl.ts"]
+  "include": ["index.ts", "kernel.ts", "test-restore.ts"]
 }
