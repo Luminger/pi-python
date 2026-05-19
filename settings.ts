@@ -38,16 +38,45 @@ export function projectSettingsFileFor(cwd: string): string {
 export interface PiPythonSettings {
 	/** Max bytes for an automatic checkpoint pickle. Larger pickles are skipped. */
 	pickleMaxBytes: number;
+	/**
+	 * When auto-resolving the python interpreter (no --python override, no
+	 * `python_set_interpreter` set), walk from `cwd` upward looking for a
+	 * venv directory listed in `venvDirNames`. Stops at the first match.
+	 * Walks through repo subdirs and stops at the directory containing
+	 * `.git` so we never cross repo boundaries. When false, only `cwd`
+	 * itself is checked (the historical behaviour).
+	 *
+	 * Default: true. Lets pi started under `<repo>/<subdir>/<sub>/` pick
+	 * up `<repo>/<subdir>/.venv` (or `<repo>/.venv`) automatically —
+	 * canonical for uv-workspace layouts where the venv lives at the
+	 * workspace root, not next to every member.
+	 */
+	venvParentWalk: boolean;
+	/**
+	 * Directory names checked at each level when auto-resolving the
+	 * interpreter. A user-provided list FULLY OVERWRITES the default —
+	 * if you set this, the defaults (`.venv`, `venv`) are not appended.
+	 * Set to `[]` to disable venv autodiscovery entirely (you'd then
+	 * rely on `$VIRTUAL_ENV` / `$PI_PYTHON` / `--python` / fall through
+	 * to `python3` on PATH).
+	 *
+	 * Default: [".venv", "venv"].
+	 */
+	venvDirNames: string[];
 }
 
 export const DEFAULT_SETTINGS: PiPythonSettings = {
 	pickleMaxBytes: 256 * 1024 * 1024,
+	venvParentWalk: true,
+	venvDirNames: [".venv", "venv"],
 };
 
 export type SettingSource = "default" | "global" | "project" | "env";
 
 export interface SettingsSources {
 	pickleMaxBytes: SettingSource;
+	venvParentWalk: SettingSource;
+	venvDirNames: SettingSource;
 }
 
 export interface ResolvedSettings {
@@ -72,8 +101,17 @@ export function loadSettings(opts?: {
 	const env = opts?.env ?? process.env;
 	const cwd = opts?.cwd;
 
-	const values: PiPythonSettings = { ...DEFAULT_SETTINGS };
-	const sources: SettingsSources = { pickleMaxBytes: "default" };
+	const values: PiPythonSettings = {
+		...DEFAULT_SETTINGS,
+		// Defensive copy so caller mutations can't poison subsequent
+		// loadSettings() calls via the shared DEFAULT_SETTINGS reference.
+		venvDirNames: [...DEFAULT_SETTINGS.venvDirNames],
+	};
+	const sources: SettingsSources = {
+		pickleMaxBytes: "default",
+		venvParentWalk: "default",
+		venvDirNames: "default",
+	};
 	const warnings: string[] = [];
 	const projectFile = cwd ? projectSettingsFileFor(cwd) : null;
 
@@ -93,6 +131,31 @@ export function loadSettings(opts?: {
 				`PI_PYTHON_PICKLE_MAX_BYTES=${JSON.stringify(envBytes)} is not a positive integer`,
 			);
 		}
+	}
+
+	const envWalk = env.PI_PYTHON_VENV_PARENT_WALK;
+	if (envWalk !== undefined && envWalk !== "") {
+		const parsed = parseBoolean(envWalk);
+		if (parsed !== null) {
+			values.venvParentWalk = parsed;
+			sources.venvParentWalk = "env";
+		} else {
+			warnings.push(
+				`PI_PYTHON_VENV_PARENT_WALK=${JSON.stringify(envWalk)} is not a boolean (true/false/1/0)`,
+			);
+		}
+	}
+
+	const envDirNames = env.PI_PYTHON_VENV_DIR_NAMES;
+	if (envDirNames !== undefined) {
+		// Comma-separated; empty-but-set means "no dir names" (disable
+		// autodiscovery). To use the default, leave the env var unset.
+		const parts = envDirNames
+			.split(",")
+			.map((s) => s.trim())
+			.filter((s) => s.length > 0);
+		values.venvDirNames = parts;
+		sources.venvDirNames = "env";
 	}
 
 	return {
@@ -137,6 +200,50 @@ function applyFile(
 			`${source} settings (${path}): pickleMaxBytes must be a positive number, got ${JSON.stringify(fileBytes)}`,
 		);
 	}
+
+	const fileWalk = obj.venvParentWalk;
+	if (typeof fileWalk === "boolean") {
+		values.venvParentWalk = fileWalk;
+		sources.venvParentWalk = source;
+	} else if (fileWalk !== undefined) {
+		warnings.push(
+			`${source} settings (${path}): venvParentWalk must be a boolean, got ${JSON.stringify(fileWalk)}`,
+		);
+	}
+
+	const fileDirNames = obj.venvDirNames;
+	if (Array.isArray(fileDirNames)) {
+		const cleaned: string[] = [];
+		let bad = false;
+		for (const entry of fileDirNames) {
+			if (typeof entry === "string" && entry.length > 0) {
+				cleaned.push(entry);
+			} else {
+				bad = true;
+				break;
+			}
+		}
+		if (bad) {
+			warnings.push(
+				`${source} settings (${path}): venvDirNames must be an array of non-empty strings, got ${JSON.stringify(fileDirNames)}`,
+			);
+		} else {
+			// Full overwrite — user's list is the list, defaults are not appended.
+			values.venvDirNames = cleaned;
+			sources.venvDirNames = source;
+		}
+	} else if (fileDirNames !== undefined) {
+		warnings.push(
+			`${source} settings (${path}): venvDirNames must be an array of strings, got ${JSON.stringify(fileDirNames)}`,
+		);
+	}
+}
+
+function parseBoolean(raw: string): boolean | null {
+	const v = raw.trim().toLowerCase();
+	if (["true", "1", "yes", "on"].includes(v)) return true;
+	if (["false", "0", "no", "off"].includes(v)) return false;
+	return null;
 }
 
 function parsePositiveInteger(raw: string): number | null {

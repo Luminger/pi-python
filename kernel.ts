@@ -599,11 +599,27 @@ export function filterEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	return out;
 }
 
-/** Resolve which python interpreter to use. */
+/**
+ * Resolve which python interpreter to use.
+ *
+ * Order of precedence:
+ *   1. Explicit `override` (the `--python` flag or `python_set_interpreter`).
+ *   2. `$PI_PYTHON` env var.
+ *   3. `$VIRTUAL_ENV` env var (canonical for direnv / `source .venv/bin/activate`).
+ *   4. A venv directory — named by `venvDirNames`, default `.venv` and
+ *      `venv` — found in `cwd`. When `walkParents` is true (the default),
+ *      the search ascends from `cwd` until either a venv is found or a
+ *      repo root (dir with `.git`) is encountered — we never cross a repo
+ *      boundary, so a pi session started in some unrelated subdir won't
+ *      latch onto a far-away venv.
+ *   5. Bare `python3` / `python.exe` on PATH; spawn() resolves it.
+ */
 export function resolvePythonPath(opts: {
 	override?: string | null;
 	cwd: string;
 	env?: NodeJS.ProcessEnv;
+	walkParents?: boolean;
+	venvDirNames?: string[];
 }): string {
 	const env = opts.env ?? process.env;
 
@@ -620,9 +636,21 @@ export function resolvePythonPath(opts: {
 		candidates.push(join(env.VIRTUAL_ENV, "bin", "python"));
 		candidates.push(join(env.VIRTUAL_ENV, "Scripts", "python.exe"));
 	}
-	for (const dir of [".venv", "venv"]) {
-		candidates.push(resolve(opts.cwd, dir, "bin", "python"));
-		candidates.push(resolve(opts.cwd, dir, "Scripts", "python.exe"));
+
+	const venvDirs = opts.venvDirNames ?? [".venv", "venv"];
+	const walk = opts.walkParents !== false;
+	let dir = opts.cwd;
+	while (true) {
+		for (const sub of venvDirs) {
+			candidates.push(resolve(dir, sub, "bin", "python"));
+			candidates.push(resolve(dir, sub, "Scripts", "python.exe"));
+		}
+		if (!walk) break;
+		// This level is a repo root — search it (already pushed above) then stop.
+		if (existsSync(join(dir, ".git"))) break;
+		const parent = dirname(dir);
+		if (parent === dir) break; // filesystem root
+		dir = parent;
 	}
 
 	for (const candidate of candidates) {

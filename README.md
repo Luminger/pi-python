@@ -164,7 +164,19 @@ source. Schema:
 {
   // Max bytes for an automatic checkpoint pickle. Larger pickles are
   // skipped (and the leaf is marked so we don't retry). Default: 256 MB.
-  "pickleMaxBytes": 268435456
+  "pickleMaxBytes": 268435456,
+
+  // When auto-resolving the interpreter, walk from `cwd` upward looking
+  // for a venv. Stops at the first match, or at a `.git` repo root
+  // (never crosses repo boundaries). Default: true.
+  "venvParentWalk": true,
+
+  // Directory names checked at each level when auto-resolving the
+  // interpreter. A user-provided list FULLY OVERWRITES the default —
+  // setting `[".my-env"]` means *only* `.my-env` is searched, the
+  // defaults below are not appended. Set to `[]` to disable venv
+  // autodiscovery entirely. Default: [".venv", "venv"].
+  "venvDirNames": [".venv", "venv"]
 }
 ```
 
@@ -176,6 +188,8 @@ built-in default.
 | Env var | Setting it overrides |
 | ------- | -------------------- |
 | `PI_PYTHON_PICKLE_MAX_BYTES` | `pickleMaxBytes` (positive integer, in bytes) |
+| `PI_PYTHON_VENV_PARENT_WALK` | `venvParentWalk` (boolean: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`) |
+| `PI_PYTHON_VENV_DIR_NAMES` | `venvDirNames` (comma-separated; an explicitly-empty value disables autodiscovery; leave the env var unset to use the default) |
 | `PI_PYTHON` | Default interpreter (same role as `--python`, lower precedence than the flag and `python_set_interpreter`) |
 
 ## Interpreter resolution
@@ -186,7 +200,11 @@ In order of priority:
 2. `--python <path>` CLI flag
 3. `$PI_PYTHON` env var
 4. `$VIRTUAL_ENV/bin/python`
-5. `<cwd>/.venv/bin/python`, `<cwd>/venv/bin/python`
+5. A venv directory named in `venvDirNames` (default: `.venv`, `venv`)
+   found in `cwd`. If `venvParentWalk` is true (default), the search
+   ascends from `cwd` until a venv is found or a `.git` repo root is
+   hit — useful for uv-workspace layouts where the venv lives at the
+   workspace root, not next to every member.
 6. `python3` on `PATH`
 
 `python_set_interpreter` and the `--python` flag both accept either an

@@ -119,7 +119,13 @@ export default function pythonExtension(pi: ExtensionAPI) {
 			}
 			kernel = null;
 		}
-		const pythonPath = resolvePythonPath({ override: pythonOverride, cwd });
+		const { values: settings } = loadSettings({ cwd });
+		const pythonPath = resolvePythonPath({
+			override: pythonOverride,
+			cwd,
+			walkParents: settings.venvParentWalk,
+			venvDirNames: settings.venvDirNames,
+		});
 		const next = new PythonKernel({ pythonPath, cwd });
 		await next.start();
 		kernel = next;
