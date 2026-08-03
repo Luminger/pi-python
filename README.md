@@ -163,6 +163,8 @@ source. Schema:
 ```jsonc
 {
   // Max bytes for an automatic checkpoint pickle. Larger pickles are
+| `PI_PYTHON_MAX_TIMEOUT_SECONDS` | `maxTimeoutSeconds` (positive integer) |
+| `PI_PYTHON_INTERRUPT_GRACE_MS` | `interruptGraceMs` (non-negative integer; 0 disables auto-kill) |
   // skipped (and the leaf is marked so we don't retry). Default: 256 MB.
   "pickleMaxBytes": 268435456,
 

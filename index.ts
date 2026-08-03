@@ -210,20 +210,70 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		executionMode: "sequential",
 		description:
 			"Execute Python code in a persistent interpreter session. " +
+		renderResult(result, options, _theme, context) {
+			const state = context.state as PythonRenderState;
+
+			// Start a 1s redraw tick while partial so the elapsed counter
+			// updates live — same pattern as the built-in Bash tool.
+			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+				state.interval = setInterval(() => context.invalidate(), 1000);
+			}
+			if (!options.isPartial || context.isError) {
+				state.endedAt ??= Date.now();
+				if (state.interval) {
+					clearInterval(state.interval);
+					state.interval = undefined;
+				}
+			}
+
+			// Build a fresh container each render. The body text is already
+			// fully formatted by formatExecuteResult; we just append a
+			// timing footer.
+			const container = new Container();
+
+			// Main result text.
+			const firstContent = result.content?.[0];
+			const body = (firstContent && "text" in firstContent) ? firstContent.text : "";
+			if (body) {
+				container.addChild(new Text(body, 0, 0));
+			}
+
+			// Footer: elapsed/took time (+ timeout if set).
+			if (state.startedAt !== undefined) {
+				const label = options.isPartial ? "Elapsed" : "Took";
+				const endTime = state.endedAt ?? Date.now();
+				const elapsed = formatDurationMs(endTime - state.startedAt);
+
+				const args = context.args;
+				const timeout = args?.timeout;
+				const timeoutSuffix = timeout ? ` / timeout ${timeout}s` : "";
+
+				container.addChild(
+					new Text(`\n${label} ${elapsed}${timeoutSuffix}`, 0, 0),
+				);
+			}
+
+			return container;
+		},
 			"Variables, imports, and definitions persist across calls in the same session, " +
 			"and are automatically checkpointed to disk so kernel restarts don't lose state. " +
 			"Cells run sequentially; if a cell raises, later cells are skipped. " +
-			`Default timeout is ${DEFAULT_TIMEOUT_S}s (max ${MAX_TIMEOUT_S}s); pass a higher \`timeout\` ` +
-			"for long-running work. Use cells: [{code: '...'}].",
+			`Default timeout is ${DEFAULT_TIMEOUT_S}s (cap ${DEFAULT_MAX_TIMEOUT_S}s by default, ` +
+			"raise via project settings.json `maxTimeoutSeconds`); pass a higher `timeout` for " +
+			"long-running work. On timeout the cell is SIGINT'd \u2014 the runner catches " +
+			"KeyboardInterrupt cleanly and the namespace from cells that completed first " +
+			"survives for the next call. Use cells: [{code: '...'}].",
 		promptSnippet:
 			"Run Python code in a persistent kernel for data wrangling, math, and parsing",
 		promptGuidelines: [
 			"Use python for non-trivial data transforms, JSON/CSV parsing, math, and stateful scratch work.",
 			"Use python with multiple cells when you want to inspect intermediate results without rerunning earlier setup.",
-			"Pass python's `timeout` parameter (in seconds, up to 600) for long-running work like training, large IO, or expensive aggregations — the default of 120s is tuned for interactive scratch work.",
+			`Pass python's \`timeout\` parameter (in seconds, up to ${DEFAULT_MAX_TIMEOUT_S}) for long-running work like training, large IO, or expensive aggregations \u2014 the default of ${DEFAULT_TIMEOUT_S}s is tuned for interactive scratch work.`,
+			"Long cells that hit a timeout still preserve namespace state from any cells that completed first \u2014 you can resume work in a follow-up `python` call without restarting from scratch.",
 		],
 		parameters: Type.Object({
 			cells: Type.Array(
+				interruptGraceMs: callSettings.interruptGraceMs,
 				Type.Object({
 					code: Type.String({
 						description: "Python source for this cell. Last expression's value is shown.",
@@ -236,7 +286,12 @@ export default function pythonExtension(pi: ExtensionAPI) {
 			),
 			timeout: Type.Optional(
 				Type.Number({
-					description: `Wall-clock timeout in seconds for the whole call. Defaults to ${DEFAULT_TIMEOUT_S}s, clamped to ${MIN_TIMEOUT_S}-${MAX_TIMEOUT_S}.`,
+					description:
+						`Wall-clock timeout in seconds for the whole call. Defaults to ${DEFAULT_TIMEOUT_S}s. ` +
+						`Maximum is ${DEFAULT_MAX_TIMEOUT_S}s out of the box (1h), configurable per project via ` +
+						"settings.json `maxTimeoutSeconds`. On timeout the runner is SIGINT'd; the kernel " +
+						"catches KeyboardInterrupt and keeps the namespace, so any state populated by cells " +
+						"that completed before the interrupt survives.",
 				}),
 			),
 			reset: Type.Optional(
@@ -252,7 +307,13 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				}),
 			),
 		}),
-		renderCall(args, theme, _context) {
+		renderCall(args, theme, context) {
+			const state = context.state as PythonRenderState;
+			if (context.executionStarted && state.startedAt === undefined) {
+				state.startedAt = Date.now();
+				state.endedAt = undefined;
+			}
+
 			const cells = Array.isArray(args?.cells) ? args.cells : [];
 			const lines: string[] = [];
 
@@ -298,7 +359,8 @@ export default function pythonExtension(pi: ExtensionAPI) {
 					title: c.title,
 				}),
 			);
-			const timeoutS = clampTimeout(params.timeout);
+			const { values: callSettings } = loadSettings({ cwd });
+			const timeoutS = clampTimeout(params.timeout, callSettings.maxTimeoutSeconds);
 
 			const k = await ensureKernel(cwd, restorePathFor(ctx));
 
@@ -448,6 +510,7 @@ export default function pythonExtension(pi: ExtensionAPI) {
 			lines.push(
 				`  pickleMaxBytes: ${formatSize(settings.pickleMaxBytes)} ` +
 					`(${settings.pickleMaxBytes} bytes, source: ${sources.pickleMaxBytes})`,
+}
 			);
 			for (const w of warnings) lines.push(`  warning: ${w}`);
 
@@ -697,9 +760,20 @@ export default function pythonExtension(pi: ExtensionAPI) {
 
 // ─── helpers (module scope) ─────────────────────────────────────────────────
 
-function clampTimeout(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_TIMEOUT_S;
-	return Math.min(Math.max(value, MIN_TIMEOUT_S), MAX_TIMEOUT_S);
+function formatDurationMs(ms: number): string {
+	const s = ms / 1000;
+	if (s < 60) return `${s.toFixed(1)}s`;
+	const m = Math.floor(s / 60);
+	const rem = s - m * 60;
+	return `${m}m${rem.toFixed(0)}s`;
+}
+
+function clampTimeout(value: number | undefined, maxSeconds: number): number {
+	const cap = Math.max(MIN_TIMEOUT_S, Math.floor(maxSeconds));
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return Math.min(DEFAULT_TIMEOUT_S, cap);
+	}
+	return Math.min(Math.max(value, MIN_TIMEOUT_S), cap);
 }
 
 function resolveCwd(requested: string | undefined, fallback: string): string {

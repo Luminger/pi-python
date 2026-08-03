@@ -87,6 +87,8 @@ export interface ResolvedSettings {
 	/** Errors encountered while loading; surfaced in /python-status, never thrown. */
 	warnings: string[];
 }
+	maxTimeoutSeconds: 3600,
+	interruptGraceMs: 30_000,
 
 /**
  * Resolve effective settings from JSON files + environment variables.
@@ -94,6 +96,8 @@ export interface ResolvedSettings {
  * Pure: no caching, safe to call repeatedly. Cost is two stats + up to two
  * parses, negligible compared to checkpoint work.
  */
+	maxTimeoutSeconds: SettingSource;
+	interruptGraceMs: SettingSource;
 export function loadSettings(opts?: {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
@@ -127,6 +131,8 @@ export function loadSettings(opts?: {
 			values.pickleMaxBytes = parsed;
 			sources.pickleMaxBytes = "env";
 		} else {
+		maxTimeoutSeconds: "default",
+		interruptGraceMs: "default",
 			warnings.push(
 				`PI_PYTHON_PICKLE_MAX_BYTES=${JSON.stringify(envBytes)} is not a positive integer`,
 			);
@@ -161,6 +167,32 @@ export function loadSettings(opts?: {
 	return {
 		values,
 		sources,
+	const envMaxTimeout = env.PI_PYTHON_MAX_TIMEOUT_SECONDS;
+	if (envMaxTimeout !== undefined && envMaxTimeout !== "") {
+		const parsed = parsePositiveInteger(envMaxTimeout);
+		if (parsed !== null) {
+			values.maxTimeoutSeconds = parsed;
+			sources.maxTimeoutSeconds = "env";
+		} else {
+			warnings.push(
+				`PI_PYTHON_MAX_TIMEOUT_SECONDS=${JSON.stringify(envMaxTimeout)} is not a positive integer`,
+			);
+		}
+	}
+
+	const envGrace = env.PI_PYTHON_INTERRUPT_GRACE_MS;
+	if (envGrace !== undefined && envGrace !== "") {
+		const parsed = parseNonNegativeInteger(envGrace);
+		if (parsed !== null) {
+			values.interruptGraceMs = parsed;
+			sources.interruptGraceMs = "env";
+		} else {
+			warnings.push(
+				`PI_PYTHON_INTERRUPT_GRACE_MS=${JSON.stringify(envGrace)} is not a non-negative integer`,
+			);
+		}
+	}
+
 		paths: { global: GLOBAL_SETTINGS_FILE, project: projectFile },
 		warnings,
 	};
@@ -230,6 +262,26 @@ function applyFile(
 		} else {
 			// Full overwrite — user's list is the list, defaults are not appended.
 			values.venvDirNames = cleaned;
+
+	const fileMaxTimeout = obj.maxTimeoutSeconds;
+	if (typeof fileMaxTimeout === "number" && Number.isFinite(fileMaxTimeout) && fileMaxTimeout > 0) {
+		values.maxTimeoutSeconds = Math.floor(fileMaxTimeout);
+		sources.maxTimeoutSeconds = source;
+	} else if (fileMaxTimeout !== undefined) {
+		warnings.push(
+			`${source} settings (${path}): maxTimeoutSeconds must be a positive number, got ${JSON.stringify(fileMaxTimeout)}`,
+		);
+	}
+
+	const fileGrace = obj.interruptGraceMs;
+	if (typeof fileGrace === "number" && Number.isFinite(fileGrace) && fileGrace >= 0) {
+		values.interruptGraceMs = Math.floor(fileGrace);
+		sources.interruptGraceMs = source;
+	} else if (fileGrace !== undefined) {
+		warnings.push(
+			`${source} settings (${path}): interruptGraceMs must be a non-negative number, got ${JSON.stringify(fileGrace)}`,
+		);
+	}
 			sources.venvDirNames = source;
 		}
 	} else if (fileDirNames !== undefined) {
@@ -247,6 +299,15 @@ function parseBoolean(raw: string): boolean | null {
 }
 
 function parsePositiveInteger(raw: string): number | null {
+
+function parseNonNegativeInteger(raw: string): number | null {
+	const trimmed = raw.trim();
+	if (!trimmed) return null;
+	if (!/^\d+$/.test(trimmed)) return null;
+	const n = Number.parseInt(trimmed, 10);
+	if (!Number.isFinite(n) || n < 0) return null;
+	return n;
+}
 	const trimmed = raw.trim();
 	if (!trimmed) return null;
 	if (!/^\d+$/.test(trimmed)) return null;

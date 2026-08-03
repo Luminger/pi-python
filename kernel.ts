@@ -144,7 +144,13 @@ export class PythonKernel {
 	}
 
 	isAlive(): boolean {
-		return this.proc !== null && this.proc.exitCode === null && !this.proc.killed;
+		// `proc.killed` is set to true by Node *whenever* we call proc.kill(),
+		// even with a non-fatal signal (SIGINT just interrupts). The only
+		// reliable "the process is still running" check is whether it has
+		// reported an exit yet — exitCode and signalCode are both null until
+		// then.
+		if (this.proc === null) return false;
+		return this.proc.exitCode === null && this.proc.signalCode === null;
 	}
 
 	/** Lazily spawn and wait for the runner's `ready` event. */
@@ -432,6 +438,7 @@ export class PythonKernel {
 
 		if (opts.timeoutMs && opts.timeoutMs > 0) {
 			pending.timer = setTimeout(() => {
+			const graceMs = opts.interruptGraceMs ?? 30_000;
 				pending.timedOut = true;
 				pending.cancelled = true;
 				this.interrupt();
@@ -481,6 +488,9 @@ export class PythonKernel {
 		});
 
 		try {
+			// All three must be cleared: the grace/retry timers outlive the
+			// timeout timer by design, and a stray one left armed keeps the
+			// event loop alive for up to graceMs after the call returned.
 			proc.stdin.write(`${JSON.stringify({ ...payload, id })}\n`);
 		} catch (err) {
 			this.pendingRpc.delete(id);

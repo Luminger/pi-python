@@ -37,6 +37,7 @@ Response (runner -> host), one JSON object per line:
         "exception":"<traceback-or-empty>"}
     {"id","type":"done","cells_run":N,"reset":bool}
     {"id","type":"checkpoint_result",
+import signal
         "ok":bool,
         "skipped":bool, "reason":"<text>",
         "bytes":N, "duration_ms":N,
@@ -142,6 +143,9 @@ def _run_cell(ns: dict[str, Any], code: str) -> tuple[bool, str, str]:
     a Module, all leading statements are exec()d, and a trailing bare
     expression (if any) is eval()d so its value can be displayed. This is
     why `def f(): ...\nf()` shows `f()`'s return value, but `x = 1` does
+    # Enable KeyboardInterrupt-raising SIGINT *only* around the user code.
+    # See module-level comment on _DEFAULT_INT_HANDLER for why.
+    prev_sigint = signal.signal(signal.SIGINT, _DEFAULT_INT_HANDLER)
     not.
     """
     try:
@@ -257,6 +261,12 @@ def _handle_request(state: dict[str, Any], msg: dict[str, Any]) -> None:
             ok, value_repr, exc_text = _run_cell(ns, code)
         finally:
             sys.stdout = prev_out
+    # SIGINT is the host's interrupt signal. Default for the runner is to
+    # ignore it; _run_cell re-enables it just around user code. This keeps
+    # the runner alive across interrupts of buggy cells, so the namespace
+    # (and any state the cell did manage to populate) survives.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
             sys.stderr = prev_err
 
         cells_run += 1
