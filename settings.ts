@@ -13,14 +13,14 @@
  * with the rest of the extension still functional.
  *
  * Precedence (highest wins):
- *   1. Environment variable (e.g. PI_PYTHON_PICKLE_MAX_BYTES)
+ *   1. Environment variable (e.g. PI_PYTHON_MAX_TIMEOUT_SECONDS)
  *   2. Project settings.json
  *   3. Global settings.json
  *   4. Built-in default
  *
  * Settings are reloaded on every `loadSettings()` call (no caching), so
  * editing either file or exporting an env var takes effect on the next
- * checkpoint without restarting pi.
+ * kernel spawn without restarting pi.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -36,8 +36,6 @@ export function projectSettingsFileFor(cwd: string): string {
 }
 
 export interface PiPythonSettings {
-	/** Max bytes for an automatic checkpoint pickle. Larger pickles are skipped. */
-	pickleMaxBytes: number;
 	/**
 	 * When auto-resolving the python interpreter (no --python override, no
 	 * `python_set_interpreter` set), walk from `cwd` upward looking for a
@@ -63,20 +61,43 @@ export interface PiPythonSettings {
 	 * Default: [".venv", "venv"].
 	 */
 	venvDirNames: string[];
+	/**
+	 * Upper bound (seconds) the `python` tool's `timeout` parameter is
+	 * clamped to. The agent can ask for shorter, but never longer. Use
+	 * this to allow very long running cells (data pulls, training, etc.)
+	 * without editing the extension.
+	 *
+	 * Default: 3600 (1 hour).
+	 */
+	maxTimeoutSeconds: number;
+	/**
+	 * Grace period (milliseconds) after the timeout fires before the
+	 * kernel is hard-killed. The host always sends SIGINT first; the
+	 * runner catches KeyboardInterrupt and wraps up the cell cleanly
+	 * (preserving the namespace and any state the cell did populate).
+	 * SIGKILL is the fallback for genuinely wedged kernels (C extensions
+	 * that ignore signals, etc.) — it costs the namespace, which is
+	 * unrecoverable, so give slow-but-alive cells room to finish.
+	 *
+	 * Default: 30000 (30 seconds).
+	 */
+	interruptGraceMs: number;
 }
 
 export const DEFAULT_SETTINGS: PiPythonSettings = {
-	pickleMaxBytes: 256 * 1024 * 1024,
 	venvParentWalk: true,
 	venvDirNames: [".venv", "venv"],
+	maxTimeoutSeconds: 3600,
+	interruptGraceMs: 30_000,
 };
 
 export type SettingSource = "default" | "global" | "project" | "env";
 
 export interface SettingsSources {
-	pickleMaxBytes: SettingSource;
 	venvParentWalk: SettingSource;
 	venvDirNames: SettingSource;
+	maxTimeoutSeconds: SettingSource;
+	interruptGraceMs: SettingSource;
 }
 
 export interface ResolvedSettings {
@@ -87,17 +108,13 @@ export interface ResolvedSettings {
 	/** Errors encountered while loading; surfaced in /python-status, never thrown. */
 	warnings: string[];
 }
-	maxTimeoutSeconds: 3600,
-	interruptGraceMs: 30_000,
 
 /**
  * Resolve effective settings from JSON files + environment variables.
  *
  * Pure: no caching, safe to call repeatedly. Cost is two stats + up to two
- * parses, negligible compared to checkpoint work.
+ * parses.
  */
-	maxTimeoutSeconds: SettingSource;
-	interruptGraceMs: SettingSource;
 export function loadSettings(opts?: {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
@@ -112,9 +129,10 @@ export function loadSettings(opts?: {
 		venvDirNames: [...DEFAULT_SETTINGS.venvDirNames],
 	};
 	const sources: SettingsSources = {
-		pickleMaxBytes: "default",
 		venvParentWalk: "default",
 		venvDirNames: "default",
+		maxTimeoutSeconds: "default",
+		interruptGraceMs: "default",
 	};
 	const warnings: string[] = [];
 	const projectFile = cwd ? projectSettingsFileFor(cwd) : null;
@@ -124,21 +142,6 @@ export function loadSettings(opts?: {
 	if (projectFile) applyFile(projectFile, "project", values, sources, warnings);
 
 	// Env var beats files.
-	const envBytes = env.PI_PYTHON_PICKLE_MAX_BYTES;
-	if (envBytes !== undefined && envBytes !== "") {
-		const parsed = parsePositiveInteger(envBytes);
-		if (parsed !== null) {
-			values.pickleMaxBytes = parsed;
-			sources.pickleMaxBytes = "env";
-		} else {
-		maxTimeoutSeconds: "default",
-		interruptGraceMs: "default",
-			warnings.push(
-				`PI_PYTHON_PICKLE_MAX_BYTES=${JSON.stringify(envBytes)} is not a positive integer`,
-			);
-		}
-	}
-
 	const envWalk = env.PI_PYTHON_VENV_PARENT_WALK;
 	if (envWalk !== undefined && envWalk !== "") {
 		const parsed = parseBoolean(envWalk);
@@ -164,9 +167,6 @@ export function loadSettings(opts?: {
 		sources.venvDirNames = "env";
 	}
 
-	return {
-		values,
-		sources,
 	const envMaxTimeout = env.PI_PYTHON_MAX_TIMEOUT_SECONDS;
 	if (envMaxTimeout !== undefined && envMaxTimeout !== "") {
 		const parsed = parsePositiveInteger(envMaxTimeout);
@@ -193,6 +193,9 @@ export function loadSettings(opts?: {
 		}
 	}
 
+	return {
+		values,
+		sources,
 		paths: { global: GLOBAL_SETTINGS_FILE, project: projectFile },
 		warnings,
 	};
@@ -223,16 +226,6 @@ function applyFile(
 	}
 	const obj = raw as Record<string, unknown>;
 
-	const fileBytes = obj.pickleMaxBytes;
-	if (typeof fileBytes === "number" && Number.isFinite(fileBytes) && fileBytes > 0) {
-		values.pickleMaxBytes = Math.floor(fileBytes);
-		sources.pickleMaxBytes = source;
-	} else if (fileBytes !== undefined) {
-		warnings.push(
-			`${source} settings (${path}): pickleMaxBytes must be a positive number, got ${JSON.stringify(fileBytes)}`,
-		);
-	}
-
 	const fileWalk = obj.venvParentWalk;
 	if (typeof fileWalk === "boolean") {
 		values.venvParentWalk = fileWalk;
@@ -262,6 +255,13 @@ function applyFile(
 		} else {
 			// Full overwrite — user's list is the list, defaults are not appended.
 			values.venvDirNames = cleaned;
+			sources.venvDirNames = source;
+		}
+	} else if (fileDirNames !== undefined) {
+		warnings.push(
+			`${source} settings (${path}): venvDirNames must be an array of strings, got ${JSON.stringify(fileDirNames)}`,
+		);
+	}
 
 	const fileMaxTimeout = obj.maxTimeoutSeconds;
 	if (typeof fileMaxTimeout === "number" && Number.isFinite(fileMaxTimeout) && fileMaxTimeout > 0) {
@@ -282,13 +282,6 @@ function applyFile(
 			`${source} settings (${path}): interruptGraceMs must be a non-negative number, got ${JSON.stringify(fileGrace)}`,
 		);
 	}
-			sources.venvDirNames = source;
-		}
-	} else if (fileDirNames !== undefined) {
-		warnings.push(
-			`${source} settings (${path}): venvDirNames must be an array of strings, got ${JSON.stringify(fileDirNames)}`,
-		);
-	}
 }
 
 function parseBoolean(raw: string): boolean | null {
@@ -299,6 +292,13 @@ function parseBoolean(raw: string): boolean | null {
 }
 
 function parsePositiveInteger(raw: string): number | null {
+	const trimmed = raw.trim();
+	if (!trimmed) return null;
+	if (!/^\d+$/.test(trimmed)) return null;
+	const n = Number.parseInt(trimmed, 10);
+	if (!Number.isFinite(n) || n <= 0) return null;
+	return n;
+}
 
 function parseNonNegativeInteger(raw: string): number | null {
 	const trimmed = raw.trim();
@@ -306,12 +306,5 @@ function parseNonNegativeInteger(raw: string): number | null {
 	if (!/^\d+$/.test(trimmed)) return null;
 	const n = Number.parseInt(trimmed, 10);
 	if (!Number.isFinite(n) || n < 0) return null;
-	return n;
-}
-	const trimmed = raw.trim();
-	if (!trimmed) return null;
-	if (!/^\d+$/.test(trimmed)) return null;
-	const n = Number.parseInt(trimmed, 10);
-	if (!Number.isFinite(n) || n <= 0) return null;
 	return n;
 }

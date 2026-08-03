@@ -20,33 +20,12 @@ are supported, distinguished by the optional `type` field (default "execute").
         "cwd": "/abs/path"         # optional
     }
 
-    # type: "checkpoint" — pickle the current namespace to `path`.
-    # Writes are skipped (with reason) when the resulting blob would exceed
-    # `max_bytes` (default 256 MB). Best-effort per-key: unpicklable values
-    # are skipped without failing the whole checkpoint.
-    {"id": "...", "type": "checkpoint", "path": "...", "max_bytes": 268435456}
-
-    # type: "restore" — unpickle from `path` and merge into the namespace.
-    # Per-key best-effort on the unpickle side too.
-    {"id": "...", "type": "restore", "path": "..."}
-
 Response (runner -> host), one JSON object per line:
     {"id","type":"stdout"|"stderr","cell":N,"data":"..."}
     {"id","type":"cell_end","cell":N,"ok":bool,
         "value":"<repr-or-empty>",
         "exception":"<traceback-or-empty>"}
     {"id","type":"done","cells_run":N,"reset":bool}
-    {"id","type":"checkpoint_result",
-import signal
-        "ok":bool,
-        "skipped":bool, "reason":"<text>",
-        "bytes":N, "duration_ms":N,
-        "keys_picked":N, "keys_skipped":N,
-        "skipped_names":[...]}
-    {"id","type":"restore_result",
-        "ok":bool, "error":"<text>",
-        "keys_restored":N, "keys_failed":N,
-        "failed_names":[...], "duration_ms":N}
     {"id","type":"fatal","error":"..."}            # only on protocol errors
 
 The protocol uses sys.__stdout__ for framing, so user code that writes to
@@ -58,6 +37,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import signal
 import sys
 import time
 import traceback
@@ -66,31 +46,15 @@ from typing import Any
 # Always frame on the original stdout, regardless of redirection.
 _RAW_STDOUT = sys.__stdout__
 
-# Pick the best available serializer once at startup. dill handles
-# interactively-defined functions, classes, lambdas, and closures — the
-# common case in a notebook-style cell loop. Fall back to stdlib pickle if
-# dill isn't present so the runner stays usable on a bare interpreter.
-try:
-    import dill as _pickler  # type: ignore[import-not-found]
-
-    _PICKLER_NAME = "dill"
-except ImportError:
-    import pickle as _pickler  # type: ignore[no-redef]
-
-    _PICKLER_NAME = "pickle"
-
-# Skip these standard module dunders when checkpointing — they don't make
-# sense to round-trip and several of them aren't picklable anyway.
-_DUNDER_SKIP = {
-    "__name__",
-    "__doc__",
-    "__package__",
-    "__builtins__",
-    "__loader__",
-    "__spec__",
-    "__file__",
-    "__cached__",
-}
+# SIGINT semantics. The host sends SIGINT to interrupt a runaway cell,
+# but we don't want a stray SIGINT (delivered while the runner is between
+# cells or blocked on sys.stdin) to take down the whole subprocess and
+# lose the namespace. Strategy: install SIG_IGN at
+# startup and only switch to Python's default KeyboardInterrupt-raising
+# handler for the duration of a single cell's exec/eval. The previous
+# handler is restored in a finally so a buggy cell can't permanently
+# uninstall it.
+_DEFAULT_INT_HANDLER = signal.default_int_handler
 
 
 def _emit(obj: dict[str, Any]) -> None:
@@ -143,10 +107,12 @@ def _run_cell(ns: dict[str, Any], code: str) -> tuple[bool, str, str]:
     a Module, all leading statements are exec()d, and a trailing bare
     expression (if any) is eval()d so its value can be displayed. This is
     why `def f(): ...\nf()` shows `f()`'s return value, but `x = 1` does
-    # Enable KeyboardInterrupt-raising SIGINT *only* around the user code.
-    # See module-level comment on _DEFAULT_INT_HANDLER for why.
-    prev_sigint = signal.signal(signal.SIGINT, _DEFAULT_INT_HANDLER)
     not.
+
+    SIGINT is re-enabled around the user code so the host can interrupt a
+    runaway cell. The previous handler (typically SIG_IGN; see main()) is
+    restored unconditionally so a buggy cell can't permanently unprotect
+    the runner.
     """
     try:
         tree = ast.parse(code, "<pi-python cell>", "exec")
@@ -177,6 +143,9 @@ def _run_cell(ns: dict[str, Any], code: str) -> tuple[bool, str, str]:
     except BaseException:
         return False, "", traceback.format_exc()
 
+    # Enable KeyboardInterrupt-raising SIGINT *only* around the user code.
+    # See module-level comment on _DEFAULT_INT_HANDLER for why.
+    prev_sigint = signal.signal(signal.SIGINT, _DEFAULT_INT_HANDLER)
     try:
         exec(exec_code, ns)
         if eval_code is not None:
@@ -192,16 +161,15 @@ def _run_cell(ns: dict[str, Any], code: str) -> tuple[bool, str, str]:
         return False, "", "KeyboardInterrupt\n"
     except BaseException:
         return False, "", traceback.format_exc()
+    finally:
+        # Restore SIG_IGN (or whatever was installed before) so a stray
+        # SIGINT delivered after the cell exits — e.g. while we frame the
+        # cell_end / done events — can't take down the runner.
+        signal.signal(signal.SIGINT, prev_sigint)
 
 
 def _handle_request(state: dict[str, Any], msg: dict[str, Any]) -> None:
     kind = msg.get("type", "execute")
-    if kind == "checkpoint":
-        _handle_checkpoint(state, msg)
-        return
-    if kind == "restore":
-        _handle_restore(state, msg)
-        return
     if kind != "execute":
         _emit(
             {
@@ -261,12 +229,6 @@ def _handle_request(state: dict[str, Any], msg: dict[str, Any]) -> None:
             ok, value_repr, exc_text = _run_cell(ns, code)
         finally:
             sys.stdout = prev_out
-    # SIGINT is the host's interrupt signal. Default for the runner is to
-    # ignore it; _run_cell re-enables it just around user code. This keeps
-    # the runner alive across interrupts of buggy cells, so the namespace
-    # (and any state the cell did manage to populate) survives.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
             sys.stderr = prev_err
 
         cells_run += 1
@@ -296,225 +258,14 @@ def _handle_request(state: dict[str, Any], msg: dict[str, Any]) -> None:
     )
 
 
-def _handle_checkpoint(state: dict[str, Any], msg: dict[str, Any]) -> None:
-    request_id = msg.get("id", "")
-    path = msg.get("path", "")
-    max_bytes = int(msg.get("max_bytes") or 256 * 1024 * 1024)
-    if not isinstance(path, str) or not path:
-        _emit(
-            {
-                "id": request_id,
-                "type": "checkpoint_result",
-                "ok": False,
-                "skipped": True,
-                "reason": "path missing",
-                "bytes": 0,
-                "duration_ms": 0,
-                "keys_picked": 0,
-                "keys_skipped": 0,
-                "skipped_names": [],
-            }
-        )
-        return
-
-    started = time.monotonic()
-    ns = state["ns"]
-    safe: dict[str, Any] = {}
-    skipped_names: list[str] = []
-
-    # Per-key best-effort: try to pickle each value individually. Unpicklable
-    # values are skipped so one bad object doesn't blow away an otherwise
-    # restorable namespace. Names starting with `_` are skipped on the
-    # assumption they're internal/private; users wanting to preserve them can
-    # export them explicitly.
-    for key, value in list(ns.items()):
-        if key in _DUNDER_SKIP or key.startswith("_"):
-            continue
-        try:
-            _pickler.dumps(value)
-        except BaseException:
-            skipped_names.append(key)
-            continue
-        safe[key] = value
-
-    # Serialize the filtered dict in one shot. Doing per-key dumps above just
-    # to detect picklability is cheaper than detecting failure at write time.
-    try:
-        blob = _pickler.dumps(safe)
-    except BaseException as exc:
-        _emit(
-            {
-                "id": request_id,
-                "type": "checkpoint_result",
-                "ok": False,
-                "skipped": True,
-                "reason": f"serialize failed: {type(exc).__name__}: {exc}",
-                "bytes": 0,
-                "duration_ms": int((time.monotonic() - started) * 1000),
-                "keys_picked": 0,
-                "keys_skipped": len(skipped_names),
-                "skipped_names": skipped_names,
-            }
-        )
-        return
-
-    if len(blob) > max_bytes:
-        _emit(
-            {
-                "id": request_id,
-                "type": "checkpoint_result",
-                "ok": False,
-                "skipped": True,
-                "reason": (
-                    f"pickle size {len(blob)} bytes exceeds limit {max_bytes}"
-                ),
-                "bytes": len(blob),
-                "duration_ms": int((time.monotonic() - started) * 1000),
-                "keys_picked": len(safe),
-                "keys_skipped": len(skipped_names),
-                "skipped_names": skipped_names,
-            }
-        )
-        return
-
-    # Atomic write so a crashed pi process doesn't leave a half-written file
-    # that future restores would choke on.
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(blob)
-        os.replace(tmp, path)
-    except OSError as exc:
-        _emit(
-            {
-                "id": request_id,
-                "type": "checkpoint_result",
-                "ok": False,
-                "skipped": True,
-                "reason": f"write failed: {exc}",
-                "bytes": len(blob),
-                "duration_ms": int((time.monotonic() - started) * 1000),
-                "keys_picked": len(safe),
-                "keys_skipped": len(skipped_names),
-                "skipped_names": skipped_names,
-            }
-        )
-        return
-
-    _emit(
-        {
-            "id": request_id,
-            "type": "checkpoint_result",
-            "ok": True,
-            "skipped": False,
-            "reason": "",
-            "bytes": len(blob),
-            "duration_ms": int((time.monotonic() - started) * 1000),
-            "keys_picked": len(safe),
-            "keys_skipped": len(skipped_names),
-            "skipped_names": skipped_names,
-        }
-    )
-
-
-def _handle_restore(state: dict[str, Any], msg: dict[str, Any]) -> None:
-    request_id = msg.get("id", "")
-    path = msg.get("path", "")
-    if not isinstance(path, str) or not path:
-        _emit(
-            {
-                "id": request_id,
-                "type": "restore_result",
-                "ok": False,
-                "error": "path missing",
-                "keys_restored": 0,
-                "keys_failed": 0,
-                "failed_names": [],
-                "duration_ms": 0,
-            }
-        )
-        return
-
-    started = time.monotonic()
-    try:
-        with open(path, "rb") as fh:
-            blob = fh.read()
-        loaded = _pickler.loads(blob)
-    except FileNotFoundError:
-        _emit(
-            {
-                "id": request_id,
-                "type": "restore_result",
-                "ok": False,
-                "error": f"checkpoint not found: {path}",
-                "keys_restored": 0,
-                "keys_failed": 0,
-                "failed_names": [],
-                "duration_ms": int((time.monotonic() - started) * 1000),
-            }
-        )
-        return
-    except BaseException as exc:
-        _emit(
-            {
-                "id": request_id,
-                "type": "restore_result",
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "keys_restored": 0,
-                "keys_failed": 0,
-                "failed_names": [],
-                "duration_ms": int((time.monotonic() - started) * 1000),
-            }
-        )
-        return
-
-    if not isinstance(loaded, dict):
-        _emit(
-            {
-                "id": request_id,
-                "type": "restore_result",
-                "ok": False,
-                "error": f"expected dict, got {type(loaded).__name__}",
-                "keys_restored": 0,
-                "keys_failed": 0,
-                "failed_names": [],
-                "duration_ms": int((time.monotonic() - started) * 1000),
-            }
-        )
-        return
-
-    ns = state["ns"]
-    failed: list[str] = []
-    restored = 0
-    for key, value in loaded.items():
-        if not isinstance(key, str):
-            continue
-        if key in _DUNDER_SKIP:
-            continue
-        try:
-            ns[key] = value
-            restored += 1
-        except BaseException:
-            failed.append(key)
-
-    _emit(
-        {
-            "id": request_id,
-            "type": "restore_result",
-            "ok": True,
-            "error": "",
-            "keys_restored": restored,
-            "keys_failed": len(failed),
-            "failed_names": failed,
-            "duration_ms": int((time.monotonic() - started) * 1000),
-        }
-    )
-
-
 def main() -> int:
     state: dict[str, Any] = {"ns": _make_namespace()}
+
+    # SIGINT is the host's interrupt signal. Default for the runner is to
+    # ignore it; _run_cell re-enables it just around user code. This keeps
+    # the runner alive across interrupts of buggy cells, so the namespace
+    # (and any state the cell did manage to populate) survives.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     # Announce ourselves once so the host can confirm the protocol version.
     _emit(
@@ -524,8 +275,7 @@ def main() -> int:
             "executable": sys.executable,
             "cwd": os.getcwd(),
             "pid": os.getpid(),
-            "protocol": 1,
-            "pickler": _PICKLER_NAME,
+            "protocol": 2,
         }
     )
 

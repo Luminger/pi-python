@@ -11,7 +11,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --experimental-transform-types --no-warnings test-restore.ts"
+    "test": "node --experimental-transform-types --no-warnings test-interrupt.ts"
   },
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "^0.70.2",

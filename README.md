@@ -4,16 +4,22 @@ A pi extension that gives the agent a persistent Python execution
 environment.
 
 Spawns one long-lived `python3 -u` subprocess per pi session, lazily on
-first use. State is checkpointed to disk after every successful cell so
-kernel restarts (and `/tree` navigation, including time travel and forks)
-preserve variables, imports, and definitions.
+first use. Variables, imports, and definitions live in that process and
+persist across tool calls for as long as it does.
+
+The namespace is deliberately **not** persisted to disk. An earlier
+version pickled the whole namespace after every call so kernel restarts
+and `/tree` navigation could resurrect it; in practice the restores were
+rarely useful, while the snapshots cost a full serialization per call and
+grew to 80 GB across 421 sessions. Re-running the cells is cheaper and
+more predictable. See *Known limitations*.
 
 ## Tools the agent sees
 
 | Tool | What it does |
 | ---- | ------------ |
-| `python` | Run one or more Python cells in the persistent kernel. Variables, imports, and definitions persist across calls and across kernel restarts (via on-disk checkpoints). Default timeout 120s, max 600s. |
-| `python_set_interpreter` | Switch the kernel to a different python interpreter binary (e.g. `/path/to/.venv/bin/python` or `python3.12`). Kills the current kernel and spawns a new one. The namespace is wiped — checkpoints are **not** restored across an interpreter switch because pickled objects from one venv typically can't load into another. |
+| `python` | Run one or more Python cells in the persistent kernel. Variables, imports, and definitions persist across calls for the life of the kernel process. Default timeout 120s, max 3600s (configurable via `maxTimeoutSeconds`). On timeout the runner is SIGINT'd; the kernel catches KeyboardInterrupt and the namespace from any cells that completed before the interrupt survives. |
+| `python_set_interpreter` | Switch the kernel to a different python interpreter binary (e.g. `/path/to/.venv/bin/python` or `python3.12`). Kills the current kernel and spawns a new one, so the namespace is wiped. |
 
 Both tools are registered with `executionMode: "sequential"` so the agent
 never tries to run two cells (or a cell and an interpreter switch)
@@ -28,8 +34,8 @@ ask the user to `/python-restart`.
 
 | Command | What it does |
 | ------- | ------------ |
-| `/python-status` | Kernel info (executable, pid, pickler) + checkpoint stats (count, total size, latest, branch coverage, fork inheritance) + active settings with their source. |
-| `/python-restart` | Kill and respawn the kernel — interrupts a hung cell — then automatically restore the latest on-disk checkpoint reachable from the current branch leaf. State up through the last successful cell is preserved. |
+| `/python-status` | Kernel info (executable, pid, cwd, alive) + active settings with their source. |
+| `/python-restart` | Kill and respawn the kernel — interrupts a hung cell. The namespace is discarded; re-run the cells you still need. |
 
 ## CLI flags
 
@@ -50,102 +56,55 @@ ask the user to `/python-restart`.
 │  kernel.ts   │     stream events     │  (persistent ns) │
 │  settings.ts │                       └──────────────────┘
 └──────────────┘
-       │
-       └─── ~/.pi/pi-python/<sessionId>/<leafId>.pkl
-              checkpoints, keyed by session tree leaf
 ```
 
 * **`runner.py`** — Python subprocess that reads NDJSON requests on stdin
-  (`execute`, `checkpoint`, `restore`) and emits framed events on stdout.
+  (`execute`) and emits framed events on stdout.
   User code that prints is captured by replacing `sys.stdout` /
   `sys.stderr` with stream writers; control messages always go through
   `sys.__stdout__`.
 * **`kernel.ts`** — Owns the subprocess. Parses the NDJSON stream, supports
   cancellation via `SIGINT`, respawns after a hard kill, exposes typed
-  `execute()` / `checkpoint()` / `restore()` methods, and validates
-  interpreter paths.
+  `execute()`, and validates interpreter paths.
 * **`settings.ts`** — Loader for `pi-python/settings.json` (global +
   project) and the `PI_PYTHON_*` env vars.
 * **`index.ts`** — Glue: registers the tools and slash commands, owns the
-  single kernel reference, hooks `message_end` for auto-checkpoint, hooks
-  `session_tree` to kill the kernel for branch-restore, hooks
-  `session_start` for fork checkpoint inheritance, and tears down on
+  single kernel reference, hooks `session_tree` to kill the kernel when
+  the conversation moves to another branch, and tears down on
   `session_shutdown`.
 
 Cells inside one `python` call run sequentially; if a cell raises, later
 cells are skipped (Jupyter notebook semantics). The trailing expression
 of a cell, if any, has its `repr()` shown — same as a notebook cell.
 
-## Checkpoints
+## Interrupt model
 
-After every successful `python` tool call the runner pickles the kernel
-namespace and writes it to:
+The kernel is designed to **survive timeouts**. SIGINT handling is
+routed carefully so a runaway cell can be interrupted without taking
+down the whole runner:
 
-```
-~/.pi/pi-python/<sessionId>/<leafId>.pkl
-```
+* At startup the runner installs `SIG_IGN` for `SIGINT`. The main
+  loop, `sys.stdin` readline, and between-cell bookkeeping all ignore
+  the signal.
+* During `_run_cell` only, the runner installs Python's default
+  `SIGINT` handler (which raises `KeyboardInterrupt`). On entry to
+  the next cell the previous handler is restored unconditionally so
+  a buggy cell can't un-protect the runner.
+* `kernel.execute()` sends `SIGINT` when `timeoutMs` expires. The cell
+  catches it, the runner emits the usual `cell_end` + `done` events,
+  and the namespace stays intact. State established by cells that
+  completed before the interrupt is preserved in the live kernel, so a
+  follow-up call resumes from there.
+* If the cell doesn't return within `interruptGraceMs` (default 30s,
+  configurable) the kernel is hard-killed as a last resort — this
+  catches genuinely wedged cases like a C extension that ignores
+  signals.
+  Set `interruptGraceMs: 0` to disable the auto-kill entirely (rely on
+  `/python-restart` for truly wedged kernels).
 
-`<leafId>` is the id of the `python` toolResult message in pi's session
-tree, so the checkpoint is naturally branch-bound: pi's `/fork`,
-`/clone`, and `/tree` navigation all just change which leaf is "current",
-and the right pickle gets restored on the next kernel spawn.
-
-The active leaf after a `/tree` jump is rarely a `python` toolResult
-itself — it's usually an assistant or user message somewhere on the
-branch. So the restore lookup walks the active branch from leaf back to
-root and loads the deepest ancestor that has a checkpoint on disk
-(equivalently: the last `python` call you'd see if you scrolled up from
-the current position). `/python-status` reports the resolved restore
-source when it differs from the active leaf.
-
-* **Pickler** — `dill` is used when importable in the active interpreter
-  (covers interactively-defined classes, lambdas, closures), else stdlib
-  `pickle` (covers basic types and module-defined objects only).
-  `/python-status` shows which one is active.
-
-  To get `dill`, install it into the **same interpreter the kernel runs**
-  — i.e. whichever venv you've pointed `--python` /
-  `python_set_interpreter` at, or your default if you haven't set one:
-
-  ```bash
-  /path/to/.venv/bin/pip install dill
-  # or, if --python is unset and pi resolves to <cwd>/.venv/bin/python:
-  source .venv/bin/activate && pip install dill
-  ```
-
-  The pickler is decided once at kernel startup, so after installing dill
-  run `/python-restart` (or wait for the next spawn) to pick it up.
-* **Per-key best-effort** — values that can't be pickled (open file
-  handles, most ML model objects, lambdas without dill) are skipped
-  individually rather than failing the whole checkpoint. Skipped names
-  appear in `/python-status`.
-* **Size cap** — pickles bigger than `pickleMaxBytes` (default 256 MB)
-  are written to nothing and the leaf is marked "skipped" for the
-  session so we don't keep retrying. Surfaced in `/python-status`.
-* **Eviction** — at most 20 checkpoints per session are kept on disk;
-  older off-branch checkpoints are evicted first. Active-branch
-  checkpoints are never evicted.
-* **Restore is automatic** on the next kernel spawn (cold start,
-  `/python-restart`, post-`/tree` navigation). The restore target is the
-  deepest ancestor of the active leaf that has a checkpoint on disk, so
-  jumping to a position between two `python` calls picks up state as of
-  the earlier call. `session_tree` also eagerly respawns when an
-  ancestor checkpoint exists so the next agent `python` call doesn't pay
-  Python startup + unpickle latency. Failures are silent (you keep going
-  with an empty namespace) but recorded — see `/python-status`.
-* **Forks inherit parent checkpoints.** When a session was forked from
-  another (`SessionHeader.parentSession` is set) the `session_start`
-  hook walks the fork's active branch and copies any of the parent's
-  pickles whose key matches an entry on that branch into the fork's own
-  checkpoint dir. Because pi's fork preserves entry ids verbatim, the
-  copied pickle is a valid checkpoint for the fork's same-id entry.
-  Existing files in the fork dir are never overwritten, so the operation
-  is idempotent. `/python-status` shows how many pickles were inherited
-  on the most recent fork. Off-branch parent pickles aren't copied; if
-  you fork from `tr1` you don't inherit `tr2`'s namespace.
-* **Switching interpreters discards state**: `python_set_interpreter`
-  does not restore from a checkpoint, since cross-interpreter pickle
-  loads typically fail.
+**Implication for long-running work**: split big jobs into multiple
+cells. State accrued in cells 0..N–1 survives a timeout in cell N,
+so a follow-up `python` call can resume from where you left off.
 
 ## Settings
 
@@ -162,12 +121,6 @@ source. Schema:
 
 ```jsonc
 {
-  // Max bytes for an automatic checkpoint pickle. Larger pickles are
-| `PI_PYTHON_MAX_TIMEOUT_SECONDS` | `maxTimeoutSeconds` (positive integer) |
-| `PI_PYTHON_INTERRUPT_GRACE_MS` | `interruptGraceMs` (non-negative integer; 0 disables auto-kill) |
-  // skipped (and the leaf is marked so we don't retry). Default: 256 MB.
-  "pickleMaxBytes": 268435456,
-
   // When auto-resolving the interpreter, walk from `cwd` upward looking
   // for a venv. Stops at the first match, or at a `.git` repo root
   // (never crosses repo boundaries). Default: true.
@@ -178,7 +131,19 @@ source. Schema:
   // setting `[".my-env"]` means *only* `.my-env` is searched, the
   // defaults below are not appended. Set to `[]` to disable venv
   // autodiscovery entirely. Default: [".venv", "venv"].
-  "venvDirNames": [".venv", "venv"]
+  "venvDirNames": [".venv", "venv"],
+
+  // Upper bound (seconds) the `python` tool's `timeout` parameter is
+  // clamped to. Raise this if you have very long-running cells (data
+  // pulls, training, large aggregations). Default: 3600 (1 hour).
+  "maxTimeoutSeconds": 3600,
+
+  // Grace period (milliseconds) after the timeout SIGINT before the
+  // kernel is hard-killed. The runner catches SIGINT and wraps up
+  // cleanly; SIGKILL only fires if the cell is genuinely wedged
+  // (e.g. a C extension that ignores signals). Set to 0 to disable
+  // the auto-kill entirely. Default: 30000.
+  "interruptGraceMs": 30000
 }
 ```
 
@@ -189,9 +154,10 @@ built-in default.
 
 | Env var | Setting it overrides |
 | ------- | -------------------- |
-| `PI_PYTHON_PICKLE_MAX_BYTES` | `pickleMaxBytes` (positive integer, in bytes) |
 | `PI_PYTHON_VENV_PARENT_WALK` | `venvParentWalk` (boolean: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`) |
 | `PI_PYTHON_VENV_DIR_NAMES` | `venvDirNames` (comma-separated; an explicitly-empty value disables autodiscovery; leave the env var unset to use the default) |
+| `PI_PYTHON_MAX_TIMEOUT_SECONDS` | `maxTimeoutSeconds` (positive integer) |
+| `PI_PYTHON_INTERRUPT_GRACE_MS` | `interruptGraceMs` (non-negative integer; 0 disables auto-kill) |
 | `PI_PYTHON` | Default interpreter (same role as `--python`, lower precedence than the flag and `python_set_interpreter`) |
 
 ## Interpreter resolution
@@ -221,8 +187,8 @@ LLM-generated code that reads `os.environ` can't exfiltrate them.
 
 The repo doubles as the extension package, so `npm install` here pulls in
 the typings and dev tooling, and `npm run check` typechecks the TS
-files. `npm test` runs the end-to-end checkpoint/restore test suite (no
-mocks; uses real `SessionManager` + real `PythonKernel`).
+files. `npm test` runs the end-to-end interrupt/timeout suite (no mocks;
+uses a real `PythonKernel`).
 
 ```bash
 npm install
@@ -296,9 +262,11 @@ a runnable interpreter.
 * **One kernel per pi process** — no shared gateway across multiple pi
   instances. If you need that, the next step is binding the kernel to a
   Unix socket per session file.
-* **Orphaned checkpoint dirs** — when a pi session is deleted, its
-  `~/.pi/pi-python/<sessionId>/` dir stays behind. No automatic cleanup
-  yet.
+* **The namespace dies with the kernel.** `/python-restart`,
+  `python_set_interpreter`, a hard kill after an ignored SIGINT, and
+  quitting pi all discard it. This is a deliberate trade against the old
+  on-disk checkpointing; if you need state to outlive the process, write
+  it to a file from inside a cell.
 
 The architecture is borrowed in spirit from
 [oh-my-pi's IPython kernel runtime](https://github.com/can1357/oh-my-pi/blob/main/docs/python-repl.md),

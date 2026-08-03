@@ -6,33 +6,31 @@
  *   - python_set_interpreter : switch the kernel to a different python binary
  *
  * Slash commands:
- *   - /python-status  : kernel info + checkpoint stats (count, disk usage, latest)
- *   - /python-restart : kill and respawn the kernel; restores the latest
- *                       on-disk checkpoint so namespace state up through the
- *                       last successful cell is preserved. Use when a cell
- *                       hangs or the kernel is wedged.
+ *   - /python-status  : kernel + interpreter + settings info
+ *   - /python-restart : kill and respawn the kernel. The namespace is lost;
+ *                       use when a cell hangs or the kernel is wedged.
  *
  * CLI flags:
  *   --python <path>   : override the interpreter used for new kernels
  *
- * State preservation:
- *   After every successful `python` tool call the runner pickles the
- *   namespace to ~/.pi/pi-python/<sessionId>/<leafId>.pkl. On the next
- *   kernel spawn (cold start, /python-restart, after /tree navigation) the
- *   pickle for the current leaf is restored automatically. dill is used
- *   when importable, stdlib pickle as a fallback. Checkpoints over 256 MB
- *   are silently skipped; see /python-status for details.
+ * Lifetime:
+ *   The namespace lives in the kernel process and nowhere else. It survives
+ *   for as long as that process does — across tool calls, across cells,
+ *   across timeouts (SIGINT leaves the process alive). It does NOT survive
+ *   /python-restart, python_set_interpreter, a hard kill after an ignored
+ *   SIGINT, or a pi restart.
+ *
+ *   This used to be backed by a per-tool-call pickle of the whole namespace
+ *   under ~/.pi/pi-python/<sessionId>/<leafId>.pkl, restored on the next
+ *   kernel spawn. It was removed: restores were rarely useful in practice
+ *   (neither across /fork nor when navigating back through history), while
+ *   the snapshots cost a full namespace serialization on every single call
+ *   and grew without bound on disk — 80 GB across 421 sessions before the
+ *   feature was pulled. Re-running the cells is cheaper and more
+ *   predictable than resurrecting a stale namespace.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-
-/**
- * The subset of SessionManager methods the extension actually consumes.
- * Sourced from ExtensionContext so we don't depend on a non-public type
- * symbol; lets us call resolveRestorePath() from tests without having to
- * fabricate the rest of an ExtensionContext.
- */
-type SessionManagerView = ExtensionContext["sessionManager"];
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -40,8 +38,8 @@ import {
 	highlightCode,
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { Container, Text } from "@mariozechner/pi-tui";
+import { existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import {
@@ -52,63 +50,28 @@ import {
 	validateInterpreterPath,
 	verifyInterpreterRuns,
 } from "./kernel.ts";
-import { loadSettings, PI_PYTHON_DIR } from "./settings.ts";
+import { loadSettings } from "./settings.ts";
 
 const DEFAULT_TIMEOUT_S = 120;
 const MIN_TIMEOUT_S = 1;
-const MAX_TIMEOUT_S = 600;
-
-const CHECKPOINT_ROOT = PI_PYTHON_DIR;
-const MAX_PICKLES_PER_SESSION = 20;
-
-interface CheckpointInfo {
-	leafId: string;
-	bytes: number;
-	durationMs: number;
-	keysPicked: number;
-	keysSkipped: number;
-	skippedNames: string[];
-	ts: number;
-}
+// Upper bound the agent can request via the `timeout` param. The setting
+// `maxTimeoutSeconds` overrides this at clamp time, so users with very
+// long-running cells (data pulls, training) can raise the ceiling without
+// touching the extension. Default 1h.
+const DEFAULT_MAX_TIMEOUT_S = 3600;
 
 export default function pythonExtension(pi: ExtensionAPI) {
 	let kernel: PythonKernel | null = null;
 	// Active explicit interpreter override. Sourced from --python at startup
 	// and updatable at runtime via the python_set_interpreter tool.
 	let pythonOverride: string | null = null;
-	// Stats for /python-status — last successful checkpoint, leaves we're
-	// not retrying because they exceeded thresholds, last restore outcome.
-	let lastCheckpoint: CheckpointInfo | null = null;
-	let lastRestore:
-		| {
-				leafId: string;
-				keysRestored: number;
-				keysFailed: number;
-				durationMs: number;
-				ts: number;
-		  }
-		| null = null;
-	// Records the most recent fork-inheritance copy (parent session id +
-	// number of pickles inherited). Surfaced in /python-status so users can
-	// confirm a fresh fork picked up the parent's checkpoints.
-	let lastInherit:
-		| {
-				parentSessionId: string;
-				copied: number;
-				ts: number;
-		  }
-		| null = null;
-	const skippedLeaves = new Set<string>();
 
 	pi.registerFlag("python", {
 		description: "Path to the Python interpreter pi-python should use",
 		type: "string",
 	});
 
-	const ensureKernel = async (
-		cwd: string,
-		restorePicklePath: string | null,
-	): Promise<PythonKernel> => {
+	const ensureKernel = async (cwd: string): Promise<PythonKernel> => {
 		if (kernel?.isAlive()) return kernel;
 		// Drop any dead reference before spawning a new one.
 		if (kernel) {
@@ -129,25 +92,6 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		const next = new PythonKernel({ pythonPath, cwd });
 		await next.start();
 		kernel = next;
-
-		// Lazy restore: if the current leaf has a checkpoint on disk, load it
-		// so the new process picks up where the dead one left off.
-		if (restorePicklePath && existsSync(restorePicklePath)) {
-			try {
-				const result = await next.restore(restorePicklePath);
-				if (result.ok) {
-					lastRestore = {
-						leafId: leafIdFromPicklePath(restorePicklePath),
-						keysRestored: result.keysRestored,
-						keysFailed: result.keysFailed,
-						durationMs: result.durationMs,
-						ts: Date.now(),
-					};
-				}
-			} catch {
-				// Restore is best-effort; an empty namespace is acceptable.
-			}
-		}
 		return next;
 	};
 
@@ -161,46 +105,6 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		kernel = null;
 	};
 
-	const restorePathFor = (ctx: ExtensionContext): string | null =>
-		resolveRestorePath(ctx.sessionManager);
-
-	const maybeCheckpoint = async (ctx: ExtensionContext): Promise<void> => {
-		if (!kernel?.isAlive()) return;
-		if (!ctx.sessionManager.getSessionFile()) return;
-		const sessionId = ctx.sessionManager.getSessionId();
-		const leafId = ctx.sessionManager.getLeafId();
-		if (!sessionId || !leafId) return;
-		if (skippedLeaves.has(leafId)) return;
-
-		const path = picklePathFor(sessionId, leafId);
-		const { values: settings } = loadSettings({ cwd: ctx.cwd });
-		try {
-			mkdirSync(checkpointDirFor(sessionId), { recursive: true });
-			const result = await kernel.checkpoint(path, settings.pickleMaxBytes);
-			if (result.ok) {
-				lastCheckpoint = {
-					leafId,
-					bytes: result.bytes,
-					durationMs: result.durationMs,
-					keysPicked: result.keysPicked,
-					keysSkipped: result.keysSkipped,
-					skippedNames: result.skippedNames,
-					ts: Date.now(),
-				};
-				// Prune old, non-branch checkpoints to keep the dir bounded.
-				const branchIds = new Set(ctx.sessionManager.getBranch().map((e) => e.id));
-				pruneCheckpoints(sessionId, branchIds, MAX_PICKLES_PER_SESSION);
-			} else if (result.skipped) {
-				// Don't retry this leaf until the kernel restarts. Big-DataFrame
-				// users see this once per leaf, not on every cell.
-				skippedLeaves.add(leafId);
-			}
-		} catch {
-			// Checkpointing is best-effort — never fail a cell because we
-			// couldn't snapshot.
-		}
-	};
-
 	pi.registerTool({
 		name: "python",
 		label: "Python",
@@ -210,53 +114,9 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		executionMode: "sequential",
 		description:
 			"Execute Python code in a persistent interpreter session. " +
-		renderResult(result, options, _theme, context) {
-			const state = context.state as PythonRenderState;
-
-			// Start a 1s redraw tick while partial so the elapsed counter
-			// updates live — same pattern as the built-in Bash tool.
-			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
-				state.interval = setInterval(() => context.invalidate(), 1000);
-			}
-			if (!options.isPartial || context.isError) {
-				state.endedAt ??= Date.now();
-				if (state.interval) {
-					clearInterval(state.interval);
-					state.interval = undefined;
-				}
-			}
-
-			// Build a fresh container each render. The body text is already
-			// fully formatted by formatExecuteResult; we just append a
-			// timing footer.
-			const container = new Container();
-
-			// Main result text.
-			const firstContent = result.content?.[0];
-			const body = (firstContent && "text" in firstContent) ? firstContent.text : "";
-			if (body) {
-				container.addChild(new Text(body, 0, 0));
-			}
-
-			// Footer: elapsed/took time (+ timeout if set).
-			if (state.startedAt !== undefined) {
-				const label = options.isPartial ? "Elapsed" : "Took";
-				const endTime = state.endedAt ?? Date.now();
-				const elapsed = formatDurationMs(endTime - state.startedAt);
-
-				const args = context.args;
-				const timeout = args?.timeout;
-				const timeoutSuffix = timeout ? ` / timeout ${timeout}s` : "";
-
-				container.addChild(
-					new Text(`\n${label} ${elapsed}${timeoutSuffix}`, 0, 0),
-				);
-			}
-
-			return container;
-		},
 			"Variables, imports, and definitions persist across calls in the same session, " +
-			"and are automatically checkpointed to disk so kernel restarts don't lose state. " +
+			"The namespace lives in the kernel process: it survives across tool calls and " +
+			"across cell timeouts, but not across /python-restart or a pi restart. " +
 			"Cells run sequentially; if a cell raises, later cells are skipped. " +
 			`Default timeout is ${DEFAULT_TIMEOUT_S}s (cap ${DEFAULT_MAX_TIMEOUT_S}s by default, ` +
 			"raise via project settings.json `maxTimeoutSeconds`); pass a higher `timeout` for " +
@@ -273,7 +133,6 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			cells: Type.Array(
-				interruptGraceMs: callSettings.interruptGraceMs,
 				Type.Object({
 					code: Type.String({
 						description: "Python source for this cell. Last expression's value is shown.",
@@ -351,6 +210,51 @@ export default function pythonExtension(pi: ExtensionAPI) {
 
 			return new Text(lines.join("\n"), 0, 0);
 		},
+		renderResult(result, options, _theme, context) {
+			const state = context.state as PythonRenderState;
+
+			// Start a 1s redraw tick while partial so the elapsed counter
+			// updates live — same pattern as the built-in Bash tool.
+			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+				state.interval = setInterval(() => context.invalidate(), 1000);
+			}
+			if (!options.isPartial || context.isError) {
+				state.endedAt ??= Date.now();
+				if (state.interval) {
+					clearInterval(state.interval);
+					state.interval = undefined;
+				}
+			}
+
+			// Build a fresh container each render. The body text is already
+			// fully formatted by formatExecuteResult; we just append a
+			// timing footer.
+			const container = new Container();
+
+			// Main result text.
+			const firstContent = result.content?.[0];
+			const body = (firstContent && "text" in firstContent) ? firstContent.text : "";
+			if (body) {
+				container.addChild(new Text(body, 0, 0));
+			}
+
+			// Footer: elapsed/took time (+ timeout if set).
+			if (state.startedAt !== undefined) {
+				const label = options.isPartial ? "Elapsed" : "Took";
+				const endTime = state.endedAt ?? Date.now();
+				const elapsed = formatDurationMs(endTime - state.startedAt);
+
+				const args = context.args;
+				const timeout = args?.timeout;
+				const timeoutSuffix = timeout ? ` / timeout ${timeout}s` : "";
+
+				container.addChild(
+					new Text(`\n${label} ${elapsed}${timeoutSuffix}`, 0, 0),
+				);
+			}
+
+			return container;
+		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const cwd = resolveCwd(params.cwd, ctx.cwd);
 			const cells: CellRequest[] = params.cells.map(
@@ -362,13 +266,14 @@ export default function pythonExtension(pi: ExtensionAPI) {
 			const { values: callSettings } = loadSettings({ cwd });
 			const timeoutS = clampTimeout(params.timeout, callSettings.maxTimeoutSeconds);
 
-			const k = await ensureKernel(cwd, restorePathFor(ctx));
+			const k = await ensureKernel(cwd);
 
 			const result = await k.execute(cells, {
 				timeoutMs: timeoutS * 1000,
 				reset: params.reset,
 				cwd,
 				signal,
+				interruptGraceMs: callSettings.interruptGraceMs,
 				onUpdate: (snapshot) => {
 					onUpdate?.({
 						content: [{ type: "text", text: formatExecuteResult(cells, snapshot, true) }],
@@ -406,13 +311,13 @@ export default function pythonExtension(pi: ExtensionAPI) {
 			"Switch the persistent Python kernel to a different interpreter binary. " +
 			"Pass an absolute path to a python executable (e.g. /path/to/.venv/bin/python or /usr/bin/python3.12), " +
 			"or a bare command name on PATH (e.g. python3.12). The current kernel is killed and a new one is started immediately, " +
-			"so all in-memory variables, imports, and definitions are discarded — checkpoints are NOT restored across an interpreter switch " +
-			"because pickled objects from one venv typically can't load into another. Use this to access libraries installed in a specific venv.",
+			"so all in-memory variables, imports, and definitions are discarded. " +
+			"Use this to access libraries installed in a specific venv.",
 		promptSnippet:
 			"Switch the persistent Python kernel to a specific interpreter binary (e.g. a venv's python) to access different installed libraries",
 		promptGuidelines: [
 			"Use python_set_interpreter when the user asks for a specific Python version or wants libraries from a particular venv. The path must point at the python binary itself (e.g. <venv>/bin/python), not the venv directory.",
-			"After python_set_interpreter, the kernel namespace is empty and on-disk checkpoints are not restored — re-import anything you need before continuing.",
+			"After python_set_interpreter, the kernel namespace is empty — re-import anything you need before continuing.",
 		],
 		parameters: Type.Object({
 			path: Type.String({
@@ -433,13 +338,9 @@ export default function pythonExtension(pi: ExtensionAPI) {
 
 			await killKernel();
 			pythonOverride = validated;
-			// Skipped-leaf decisions are scoped to a kernel process, so reset
-			// them whenever we switch interpreters.
-			skippedLeaves.clear();
 
 			try {
-				// Skip restore: cross-interpreter unpickling is unsafe.
-				const k = await ensureKernel(ctx.cwd, null);
+				const k = await ensureKernel(ctx.cwd);
 				const info = k.getInfo();
 				const pythonLine = info?.python.split("\n")[0] ?? "unknown";
 				const lines = [
@@ -453,7 +354,7 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				if (previous) {
 					lines.push(
 						`Previous kernel (pid ${previous.pid}, ${previous.executable}) was discarded; ` +
-							`namespace is fresh (no checkpoint restored).`,
+							`namespace is fresh.`,
 					);
 				}
 				return {
@@ -478,7 +379,7 @@ export default function pythonExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("python-status", {
-		description: "Show pi-python kernel and checkpoint status",
+		description: "Show pi-python kernel, interpreter, and settings status",
 		handler: async (_args, ctx) => {
 			const lines: string[] = ["pi-python kernel"];
 			if (kernel) {
@@ -489,7 +390,6 @@ export default function pythonExtension(pi: ExtensionAPI) {
 					lines.push(`  pid:        ${info.pid}`);
 					lines.push(`  cwd:        ${info.cwd}`);
 					lines.push(`  alive:      ${kernel.isAlive() ? "yes" : "no"}`);
-					lines.push(`  pickler:    ${kernel.getPickler() ?? "?"}`);
 				} else {
 					lines.push("  starting...");
 				}
@@ -508,112 +408,30 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				);
 			}
 			lines.push(
-				`  pickleMaxBytes: ${formatSize(settings.pickleMaxBytes)} ` +
-					`(${settings.pickleMaxBytes} bytes, source: ${sources.pickleMaxBytes})`,
-}
+				`  maxTimeoutSeconds: ${settings.maxTimeoutSeconds}s ` +
+					`(source: ${sources.maxTimeoutSeconds})`,
+			);
+			lines.push(
+				`  interruptGraceMs:  ${settings.interruptGraceMs}ms ` +
+					`(source: ${sources.interruptGraceMs})`,
 			);
 			for (const w of warnings) lines.push(`  warning: ${w}`);
-
-			lines.push("");
-			const sessionId = ctx.sessionManager.getSessionId();
-			if (!sessionId || !ctx.sessionManager.getSessionFile()) {
-				lines.push("checkpoints: disabled (in-memory session)");
-			} else {
-				const all = listCheckpoints(sessionId);
-				const totalBytes = all.reduce((s, c) => s + c.size, 0);
-				lines.push(`checkpoints (${checkpointDirFor(sessionId)})`);
-				lines.push(`  count:      ${all.length} / ${MAX_PICKLES_PER_SESSION} max per session`);
-				lines.push(`  total size: ${formatSize(totalBytes)}`);
-
-				if (lastCheckpoint) {
-					const ageS = Math.max(0, Math.round((Date.now() - lastCheckpoint.ts) / 1000));
-					const skipNames =
-						lastCheckpoint.skippedNames.length > 0
-							? ` (skipped: ${lastCheckpoint.skippedNames.slice(0, 4).join(", ")}${
-									lastCheckpoint.skippedNames.length > 4 ? "…" : ""
-								})`
-							: "";
-					lines.push(
-						`  latest:     ${lastCheckpoint.leafId.slice(0, 8)} — ${formatSize(lastCheckpoint.bytes)}, ` +
-							`${ageS}s ago, ${lastCheckpoint.keysPicked} keys${skipNames}`,
-					);
-				} else {
-					lines.push("  latest:     (none yet this session)");
-				}
-
-				if (lastRestore) {
-					const ageS = Math.max(0, Math.round((Date.now() - lastRestore.ts) / 1000));
-					lines.push(
-						`  restored:   ${lastRestore.leafId.slice(0, 8)} — ` +
-							`${lastRestore.keysRestored} keys, ${ageS}s ago` +
-							(lastRestore.keysFailed > 0 ? ` (${lastRestore.keysFailed} failed)` : ""),
-					);
-				}
-
-				if (lastInherit) {
-					const ageS = Math.max(0, Math.round((Date.now() - lastInherit.ts) / 1000));
-					lines.push(
-						`  inherited:  ${lastInherit.copied} from parent ${lastInherit.parentSessionId.slice(0, 8)}, ${ageS}s ago`,
-					);
-				}
-
-				const leafId = ctx.sessionManager.getLeafId();
-				if (leafId) {
-					const leafPath = picklePathFor(sessionId, leafId);
-					const leafHasOwn = existsSync(leafPath);
-					lines.push(
-						`  active leaf: ${leafId.slice(0, 8)} ${
-							leafHasOwn ? "✓ checkpoint present" : "✗ no checkpoint"
-						}`,
-					);
-					// When the active leaf has no checkpoint of its own, the
-					// branch-walk lookup will still find an ancestor pickle. Show
-					// the user which one would actually be loaded so the line above
-					// isn't misleading after /tree navigation.
-					if (!leafHasOwn) {
-						const resolved = restorePathFor(ctx);
-						if (resolved) {
-							const ancestor = leafIdFromPicklePath(resolved);
-							lines.push(
-								`  restore src: ${ancestor.slice(0, 8)} (↑ nearest ancestor on branch)`,
-							);
-						} else {
-							lines.push(`  restore src: (none on branch — fresh namespace)`);
-						}
-					}
-				}
-
-				const branchIds = new Set(ctx.sessionManager.getBranch().map((e) => e.id));
-				const onBranch = all.filter((c) => branchIds.has(c.leafId)).length;
-				lines.push(
-					`  branch:     ${onBranch} checkpoint${onBranch === 1 ? "" : "s"} on active path`,
-				);
-
-				if (skippedLeaves.size > 0) {
-					lines.push(
-						`  skipped:    ${skippedLeaves.size} leaf${skippedLeaves.size === 1 ? "" : "s"} ` +
-							`exceeded ${formatSize(settings.pickleMaxBytes)} threshold (won't retry until restart)`,
-					);
-				}
-			}
 
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 
 	pi.registerCommand("python-restart", {
-		description:
-			"Restart the pi-python kernel; preserves namespace via the latest on-disk checkpoint",
+		description: "Restart the pi-python kernel (discards the namespace)",
 		handler: async (_args, ctx) => {
 			if (kernel) {
 				const info = kernel.getInfo();
 				const ok = await ctx.ui.confirm(
 					"Restart Python kernel?",
 					`This kills ${info ? `pid ${info.pid}` : "the current kernel"} ` +
-						`(interrupting any hung cell) and respawns it. The latest on-disk ` +
-						`checkpoint for the current branch leaf will be restored, so ` +
-						`variables produced by previously-completed cells survive. ` +
-						`Anything written purely in-memory since the last successful cell is lost.`,
+						`(interrupting any hung cell) and respawns it with an empty ` +
+						`namespace. Every variable, import, and definition is lost — ` +
+						`re-run the cells you still need.`,
 				);
 				if (!ok) return;
 				try {
@@ -628,20 +446,12 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				}
 				kernel = null;
 			}
-			skippedLeaves.clear();
 
 			try {
-				const restorePath = restorePathFor(ctx);
-				const hadPickle = restorePath !== null && existsSync(restorePath);
-				const k = await ensureKernel(ctx.cwd, restorePath);
+				const k = await ensureKernel(ctx.cwd);
 				const info = k.getInfo();
-				const detail = hadPickle
-					? lastRestore
-						? `; restored ${lastRestore.keysRestored} keys`
-						: "; checkpoint present but restore reported no keys"
-					: "; no checkpoint to restore (fresh namespace)";
 				ctx.ui.notify(
-					`pi-python: kernel restarted (pid ${info?.pid ?? "?"})${detail}`,
+					`pi-python: kernel restarted (pid ${info?.pid ?? "?"}), namespace is empty`,
 					"info",
 				);
 			} catch (err) {
@@ -651,31 +461,6 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				);
 			}
 		},
-	});
-
-	// Fork inheritance: when this session was forked from another, copy the
-	// parent's per-leaf checkpoint pickles into this session's dir for any
-	// entry id on the active branch. Because /fork preserves entry ids
-	// verbatim (see SessionManager.forkFrom and createBranchedSession), a
-	// pickle keyed by entry id X in the parent is a valid pickle for entry
-	// id X in the fork. The branch-walk lookup then resolves to it on the
-	// next ensureKernel(), exactly like a non-forked session would.
-	pi.on("session_start", async (event, ctx) => {
-		if (event.reason !== "fork") return;
-		const result = inheritParentCheckpoints(ctx.sessionManager);
-		if (!result) return;
-		lastInherit = {
-			parentSessionId: result.parentSessionId,
-			copied: result.copied,
-			ts: Date.now(),
-		};
-		if (result.copied > 0) {
-			ctx.ui.notify(
-				`pi-python: inherited ${result.copied} checkpoint${result.copied === 1 ? "" : "s"} ` +
-					`from parent session ${result.parentSessionId.slice(0, 8)}`,
-				"info",
-			);
-		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -713,49 +498,26 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		);
 	});
 
-	// Checkpoint after every successful python tool result. message_end fires
-	// after the toolResult has been written to the session, so getLeafId()
-	// returns the toolResult's id, which is exactly the key we want.
-	pi.on("message_end", async (event, ctx) => {
-		const message = event.message;
-		if (message.role !== "toolResult") return;
-		if (message.toolName !== "python") return;
-		if (message.isError) return;
-		await maybeCheckpoint(ctx);
-	});
+	// Note: `session_tree` is deliberately NOT hooked. Time travel rewinds
+	// the conversation, not the interpreter — the kernel keeps whatever the
+	// cells actually put in it. Killing it on navigation was the old
+	// behaviour, which paired with checkpoint-restore; without restore that
+	// would just silently destroy a namespace every time you moved around
+	// the tree. If the namespace and the visible history disagree after a
+	// rewind, use /python-restart to get a clean one.
 
-	// /tree navigation: kill the current kernel so we don't keep state from
-	// the old branch. If the new branch has a checkpoint reachable on its
-	// ancestry, eagerly respawn + restore so the next agent `python` call
-	// doesn't pay Python startup + unpickle latency, and any restore
-	// failure surfaces in /python-status immediately rather than mid-tool.
-	// When there's nothing to restore we stay lazy — no point paying Python
-	// startup cost for an empty namespace.
-	pi.on("session_tree", async (_event, ctx) => {
-		await killKernel();
-		// skippedLeaves is keyed by leafId within a single kernel process;
-		// after a kill+respawn old entries are stale.
-		skippedLeaves.clear();
-		const restorePath = restorePathFor(ctx);
-		if (!restorePath) return;
-		try {
-			await ensureKernel(ctx.cwd, restorePath);
-		} catch {
-			// Best-effort. The next agent `python` call will retry through
-			// ensureKernel() and surface any persistent failure there.
-		}
-	});
-
-	pi.on("session_shutdown", async (_event, ctx) => {
-		// Opportunistic flush in case a cell completed but the message_end
-		// checkpoint never fired (e.g. abrupt /quit during streaming).
-		try {
-			await maybeCheckpoint(ctx);
-		} catch {
-			// ignore
-		}
+	pi.on("session_shutdown", async () => {
 		await killKernel();
 	});
+}
+
+// ─── types (module scope) ───────────────────────────────────────────────────
+
+/** Renderer state carried across renderCall / renderResult for a single tool invocation. */
+interface PythonRenderState {
+	startedAt?: number;
+	endedAt?: number;
+	interval?: ReturnType<typeof setInterval>;
 }
 
 // ─── helpers (module scope) ─────────────────────────────────────────────────
@@ -785,178 +547,6 @@ function resolveCwd(requested: string | undefined, fallback: string): string {
 	return abs;
 }
 
-export function checkpointDirFor(sessionId: string): string {
-	return join(CHECKPOINT_ROOT, sessionId);
-}
-
-export function picklePathFor(sessionId: string, leafId: string): string {
-	return join(checkpointDirFor(sessionId), `${leafId}.pkl`);
-}
-
-/**
- * Walk the session's active branch from leaf back to root and return the
- * first ancestor whose checkpoint pickle exists on disk, or `null` if no
- * ancestor is checkpointed (or the session isn't being persisted).
- *
- * Exported so tests can drive it against a real SessionManager without
- * having to assemble a full ExtensionContext.
- *
- * Why branch-walk instead of exact-leaf match: pickles are keyed by python
- * toolResult message id, but the active leaf after `/tree` navigation is
- * almost always some other entry (an assistant or user message somewhere
- * on the branch). Walking the branch finds the most recent python
- * checkpoint reachable from the new leaf.
- */
-export function resolveRestorePath(
-	sessionManager: SessionManagerView,
-): string | null {
-	if (!sessionManager.getSessionFile()) return null;
-	const sessionId = sessionManager.getSessionId();
-	if (!sessionId) return null;
-	const branch = sessionManager.getBranch();
-	// getBranch() returns root → leaf; iterate in reverse so we pick the
-	// deepest ancestor that has a checkpoint.
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const entry = branch[i];
-		if (!entry?.id) continue;
-		const path = picklePathFor(sessionId, entry.id);
-		if (existsSync(path)) return path;
-	}
-	return null;
-}
-
-/** Read just the session id out of a session file's header line. Returns
- * null if the file is missing, empty, or doesn't start with a valid
- * session header. Cheap — reads only the first line. */
-export function readSessionIdFromFile(filePath: string): string | null {
-	let content: string;
-	try {
-		content = readFileSync(filePath, { encoding: "utf8" });
-	} catch {
-		return null;
-	}
-	const firstLine = content.split("\n", 1)[0];
-	if (!firstLine) return null;
-	try {
-		const obj = JSON.parse(firstLine) as { type?: string; id?: string };
-		if (obj.type !== "session") return null;
-		return typeof obj.id === "string" ? obj.id : null;
-	} catch {
-		return null;
-	}
-}
-
-/**
- * Copy any parent-session pickles whose leaf id appears on the new (fork)
- * session's active branch into the new session's checkpoint dir.
- *
- * Safe to call on every session_start — returns null if there's no parent
- * to inherit from. Existing pickles in the destination are never
- * overwritten, so a re-run of this function (e.g. after `/python-status`)
- * is idempotent.
- *
- * Returns the parent session id and number of pickles actually copied, or
- * null if no inheritance was attempted (no parent, parent file missing,
- * etc.). Exported for testing.
- */
-export function inheritParentCheckpoints(
-	sessionManager: SessionManagerView,
-): { parentSessionId: string; copied: number } | null {
-	const newSessionId = sessionManager.getSessionId();
-	if (!newSessionId) return null;
-	const header = sessionManager.getHeader();
-	const parentPath = header?.parentSession;
-	if (!parentPath) return null;
-	const parentSessionId = readSessionIdFromFile(parentPath);
-	if (!parentSessionId || parentSessionId === newSessionId) return null;
-	const parentDir = checkpointDirFor(parentSessionId);
-	if (!existsSync(parentDir)) return { parentSessionId, copied: 0 };
-
-	const branch = sessionManager.getBranch();
-	const newDir = checkpointDirFor(newSessionId);
-	let copied = 0;
-	for (const entry of branch) {
-		if (!entry?.id) continue;
-		const parentPickle = picklePathFor(parentSessionId, entry.id);
-		if (!existsSync(parentPickle)) continue;
-		const targetPickle = picklePathFor(newSessionId, entry.id);
-		if (existsSync(targetPickle)) continue; // never clobber
-		if (copied === 0) mkdirSync(newDir, { recursive: true });
-		try {
-			copyFileSync(parentPickle, targetPickle);
-			copied++;
-		} catch {
-			// best-effort — a single failed copy shouldn't block the others
-		}
-	}
-	return { parentSessionId, copied };
-}
-
-function leafIdFromPicklePath(path: string): string {
-	const base = path.split(/[\\/]/).pop() ?? "";
-	return base.endsWith(".pkl") ? base.slice(0, -4) : base;
-}
-
-interface CheckpointFile {
-	leafId: string;
-	path: string;
-	size: number;
-	mtime: number;
-}
-
-function listCheckpoints(sessionId: string): CheckpointFile[] {
-	const dir = checkpointDirFor(sessionId);
-	if (!existsSync(dir)) return [];
-	const result: CheckpointFile[] = [];
-	for (const name of readdirSync(dir)) {
-		if (!name.endsWith(".pkl")) continue;
-		const path = join(dir, name);
-		try {
-			const s = statSync(path);
-			if (!s.isFile()) continue;
-			result.push({
-				leafId: name.slice(0, -4),
-				path,
-				size: s.size,
-				mtime: s.mtimeMs,
-			});
-		} catch {
-			// race with concurrent prune; skip
-		}
-	}
-	return result;
-}
-
-/**
- * Keep all `keepLeafIds` (active branch) plus the most-recently-modified
- * checkpoints up to `maxCount`. Evict the rest. Returns the number removed.
- */
-function pruneCheckpoints(
-	sessionId: string,
-	keepLeafIds: Set<string>,
-	maxCount: number,
-): number {
-	const all = listCheckpoints(sessionId);
-	if (all.length <= maxCount) return 0;
-	all.sort((a, b) => b.mtime - a.mtime); // newest first
-	const kept = new Set<string>();
-	for (const item of all) if (keepLeafIds.has(item.leafId)) kept.add(item.leafId);
-	for (const item of all) {
-		if (kept.size >= maxCount) break;
-		kept.add(item.leafId);
-	}
-	let removed = 0;
-	for (const item of all) {
-		if (kept.has(item.leafId)) continue;
-		try {
-			unlinkSync(item.path);
-			removed++;
-		} catch {
-			// ignore
-		}
-	}
-	return removed;
-}
 
 function formatExecuteResult(
 	requested: CellRequest[],
@@ -995,7 +585,7 @@ function formatExecuteResult(
 	const lines: string[] = [];
 	if (result.reset) lines.push("[kernel reset]");
 	if (result.timedOut) lines.push(`[timed out]`);
-	else if (result.cancelled) lines.push("[cancelled]");
+		else if (result.cancelled) lines.push("[cancelled]");
 	if (lines.length > 0) sections.unshift(lines.join(" "));
 
 	const body = sections.join("\n\n").trimEnd();

@@ -92,40 +92,11 @@ interface PendingRequest {
 	onUpdate?: (snapshot: ExecuteResult) => void;
 }
 
-export interface CheckpointResult {
-	ok: boolean;
-	skipped: boolean;
-	reason: string;
-	bytes: number;
-	durationMs: number;
-	keysPicked: number;
-	keysSkipped: number;
-	skippedNames: string[];
-}
-
-export interface RestoreResult {
-	ok: boolean;
-	error: string;
-	keysRestored: number;
-	keysFailed: number;
-	failedNames: string[];
-	durationMs: number;
-}
-
-/** Generic single-shot RPC awaiter, used for checkpoint / restore. */
-interface PendingRpc {
-	resolve: (msg: Record<string, unknown>) => void;
-	reject: (err: Error) => void;
-	expectedType: string;
-}
-
 export class PythonKernel {
 	private proc: ChildProcessWithoutNullStreams | null = null;
 	private buffer = "";
 	private pending: PendingRequest | null = null;
-	private pendingRpc = new Map<string, PendingRpc>();
 	private readyInfo: KernelInfo | null = null;
-	private pickler: "dill" | "pickle" | null = null;
 	private readyPromise: Promise<KernelInfo> | null = null;
 	private readyResolve: ((info: KernelInfo) => void) | null = null;
 	private readyReject: ((err: Error) => void) | null = null;
@@ -136,11 +107,6 @@ export class PythonKernel {
 
 	getInfo(): KernelInfo | null {
 		return this.readyInfo;
-	}
-
-	/** Which serializer the runner is using for checkpoints, if known. */
-	getPickler(): "dill" | "pickle" | null {
-		return this.pickler;
 	}
 
 	isAlive(): boolean {
@@ -176,6 +142,7 @@ export class PythonKernel {
 
 		proc.stdout.setEncoding("utf8");
 		proc.stderr.setEncoding("utf8");
+
 		proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
 		proc.stderr.on("data", (chunk: string) => this.onStderrOutOfBand(chunk));
 
@@ -206,8 +173,6 @@ export class PythonKernel {
 			this.pending.reject(err);
 			this.pending = null;
 		}
-		for (const rpc of this.pendingRpc.values()) rpc.reject(err);
-		this.pendingRpc.clear();
 	}
 
 	private onStderrOutOfBand(data: string): void {
@@ -261,20 +226,9 @@ export class PythonKernel {
 				pid: Number(msg.pid ?? this.proc?.pid ?? 0),
 				cwd: String(msg.cwd ?? this.options.cwd),
 			};
-			const pickler = msg.pickler;
-			if (pickler === "dill" || pickler === "pickle") this.pickler = pickler;
 			this.readyResolve?.(this.readyInfo);
 			this.readyResolve = null;
 			this.readyReject = null;
-			return;
-		}
-
-		if (type === "checkpoint_result" || type === "restore_result") {
-			const id = String(msg.id ?? "");
-			const rpc = this.pendingRpc.get(id);
-			if (!rpc) return;
-			this.pendingRpc.delete(id);
-			rpc.resolve(msg);
 			return;
 		}
 
@@ -383,6 +337,12 @@ export class PythonKernel {
 			signal?: AbortSignal;
 			cwd?: string;
 			onUpdate?: (snapshot: ExecuteResult) => void;
+			/**
+			 * How long to wait after the timeout SIGINT before hard-killing
+			 * the kernel. Default 30s. Set to 0 to never auto-kill (rely on
+			 * the user's /python-restart for truly wedged kernels).
+			 */
+			interruptGraceMs?: number;
 		} = {},
 	): Promise<ExecuteResult> {
 		if (!this.isAlive()) {
@@ -437,16 +397,24 @@ export class PythonKernel {
 		}
 
 		if (opts.timeoutMs && opts.timeoutMs > 0) {
-			pending.timer = setTimeout(() => {
 			const graceMs = opts.interruptGraceMs ?? 30_000;
+			pending.timer = setTimeout(() => {
 				pending.timedOut = true;
 				pending.cancelled = true;
 				this.interrupt();
-				// Hard-kill if it doesn't comply within a grace period so the
-				// user isn't stuck waiting on a runaway loop.
-				setTimeout(() => {
-					if (this.pending === pending) this.kill();
-				}, 1500);
+				// Send SIGINT first; the runner re-enables Python's default
+				// interrupt handler around each cell so the SIGINT becomes a
+				// KeyboardInterrupt the cell catches, returning cleanly with
+				// the namespace intact. If the cell doesn't return within
+				// `graceMs`, the kernel is genuinely wedged (e.g. a C
+				// extension that ignores signals) and we hard-kill so the
+				// user isn't stuck — that loses the namespace, which is the
+				// price of an unkillable cell.
+				if (graceMs > 0) {
+					setTimeout(() => {
+						if (this.pending === pending) this.kill();
+					}, graceMs);
+				}
 			}, opts.timeoutMs);
 		}
 
@@ -472,72 +440,6 @@ export class PythonKernel {
 		}
 	}
 
-	/** Send a single-shot RPC and await the matching `<type>_result` response. */
-	private async sendRpc(
-		prefix: string,
-		expectedType: string,
-		payload: Record<string, unknown>,
-	): Promise<Record<string, unknown>> {
-		if (!this.isAlive()) await this.start();
-		const proc = this.proc;
-		if (!proc) throw new Error("python kernel not running");
-
-		const id = `${prefix}-${this.nextRequestId++}`;
-		const promise = new Promise<Record<string, unknown>>((resolveRpc, rejectRpc) => {
-			this.pendingRpc.set(id, { resolve: resolveRpc, reject: rejectRpc, expectedType });
-		});
-
-		try {
-			// All three must be cleared: the grace/retry timers outlive the
-			// timeout timer by design, and a stray one left armed keeps the
-			// event loop alive for up to graceMs after the call returned.
-			proc.stdin.write(`${JSON.stringify({ ...payload, id })}\n`);
-		} catch (err) {
-			this.pendingRpc.delete(id);
-			throw err instanceof Error ? err : new Error(String(err));
-		}
-		return promise;
-	}
-
-	/** Ask the runner to pickle the current namespace to `path`. */
-	async checkpoint(path: string, maxBytes?: number): Promise<CheckpointResult> {
-		const msg = await this.sendRpc("ckpt", "checkpoint_result", {
-			type: "checkpoint",
-			path,
-			...(maxBytes !== undefined ? { max_bytes: maxBytes } : {}),
-		});
-		return {
-			ok: Boolean(msg.ok),
-			skipped: Boolean(msg.skipped),
-			reason: String(msg.reason ?? ""),
-			bytes: Number(msg.bytes ?? 0),
-			durationMs: Number(msg.duration_ms ?? 0),
-			keysPicked: Number(msg.keys_picked ?? 0),
-			keysSkipped: Number(msg.keys_skipped ?? 0),
-			skippedNames: Array.isArray(msg.skipped_names)
-				? (msg.skipped_names as unknown[]).map(String)
-				: [],
-		};
-	}
-
-	/** Restore a previously-written checkpoint into the current namespace. */
-	async restore(path: string): Promise<RestoreResult> {
-		const msg = await this.sendRpc("rst", "restore_result", {
-			type: "restore",
-			path,
-		});
-		return {
-			ok: Boolean(msg.ok),
-			error: String(msg.error ?? ""),
-			keysRestored: Number(msg.keys_restored ?? 0),
-			keysFailed: Number(msg.keys_failed ?? 0),
-			failedNames: Array.isArray(msg.failed_names)
-				? (msg.failed_names as unknown[]).map(String)
-				: [],
-			durationMs: Number(msg.duration_ms ?? 0),
-		};
-	}
-
 	/** Send SIGINT to interrupt the currently running cell. */
 	interrupt(): void {
 		if (this.proc && this.proc.exitCode === null) {
@@ -560,15 +462,10 @@ export class PythonKernel {
 		this.proc = null;
 		this.readyInfo = null;
 		this.readyPromise = null;
-		this.pickler = null;
 		if (this.pending) {
 			this.pending.reject(new Error("python kernel killed"));
 			this.pending = null;
 		}
-		for (const rpc of this.pendingRpc.values()) {
-			rpc.reject(new Error("python kernel killed"));
-		}
-		this.pendingRpc.clear();
 	}
 
 	/** Polite shutdown — close stdin so the runner exits, then reap. */
