@@ -290,6 +290,7 @@ export default function pythonExtension(pi: ExtensionAPI) {
 					cells: result.cells,
 					cancelled: result.cancelled,
 					timedOut: result.timedOut,
+					killed: result.killed ?? false,
 					reset: result.reset,
 					cellsRun: result.cellsRun,
 					python: info?.python,
@@ -584,8 +585,20 @@ function formatExecuteResult(
 
 	const lines: string[] = [];
 	if (result.reset) lines.push("[kernel reset]");
-	if (result.timedOut) lines.push(`[timed out]`);
-		else if (result.cancelled) lines.push("[cancelled]");
+	if (result.killed) {
+		// Be explicit about both halves: the output below is real and
+		// complete up to the hang, and the namespace behind it is gone. A
+		// bare "kernel died" leaves the caller unsure whether to trust
+		// either.
+		lines.push(
+			"[timed out, then hard-killed — the cell ignored SIGINT (typically a C " +
+				"extension or blocking socket). Output above this point is complete; the " +
+				"kernel namespace is GONE and the next call starts empty, so re-run any " +
+				"setup you still need. Raise `timeout` or `interruptGraceMs` if the work " +
+				"was simply slow.]",
+		);
+	} else if (result.timedOut) lines.push(`[timed out]`);
+	else if (result.cancelled) lines.push("[cancelled]");
 	if (lines.length > 0) sections.unshift(lines.join(" "));
 
 	const body = sections.join("\n\n").trimEnd();

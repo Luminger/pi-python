@@ -126,6 +126,53 @@ async function main(): Promise<void> {
 		await k.shutdown();
 	}
 
+	// ── 6. Uninterruptible cell → hard kill preserves partial output ──
+	//
+	// Regression test for the only failure mode that ever showed up in real
+	// sessions: a cell wedged in something SIGINT can't reach (here, a
+	// Python-level handler that swallows every KeyboardInterrupt, standing
+	// in for a C extension). It used to reject the whole call with the bare
+	// string "python kernel killed", discarding everything the cell had
+	// printed. It must now resolve with that output plus killed=true.
+	console.log("\n[6] uninterruptible cell: hard kill keeps partial output");
+	const k2 = new PythonKernel({ pythonPath: "python3", cwd: process.cwd() });
+	await k2.start();
+	const pid2 = k2.getInfo()?.pid;
+	try {
+		const r6 = await k2.execute(
+			[
+				{
+					code: [
+						"import time, sys",
+						"print('findings: 3 hosts reachable', flush=True)",
+						"deadline = time.time() + 30",
+						"while time.time() < deadline:",
+						"    try:",
+						"        time.sleep(0.05)",
+						"    except KeyboardInterrupt:",
+						"        pass  # swallow it, like a C ext that never checks signals",
+					].join("\n"),
+				},
+			],
+			{ timeoutMs: 500, interruptGraceMs: 1_500 },
+		);
+
+		check(r6.killed === true, `result.killed === true (got ${r6.killed})`);
+		check(r6.timedOut, "result.timedOut === true");
+		check(
+			(r6.cells[0]?.stdout ?? "").includes("findings: 3 hosts reachable"),
+			`partial stdout survived the kill (got ${JSON.stringify(r6.cells[0]?.stdout)})`,
+		);
+		check(!k2.isAlive(), "kernel is dead after the hard kill");
+
+		// And the next call must transparently respawn into a fresh namespace.
+		const r7 = await k2.execute([{ code: "'respawned'" }], { timeoutMs: 5_000 });
+		check(r7.cells[0]?.value === "'respawned'", "next execute() respawns the kernel");
+		check(k2.getInfo()?.pid !== pid2, `respawn has a new pid (${pid2} -> ${k2.getInfo()?.pid})`);
+	} finally {
+		await k2.shutdown();
+	}
+
 	console.log(`\n══ ${passed} passed · ${failed} failed ══`);
 	if (failed > 0) process.exit(1);
 }

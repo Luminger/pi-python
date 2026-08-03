@@ -63,6 +63,13 @@ export interface ExecuteResult {
 	timedOut: boolean;
 	cellsRun: number;
 	reset: boolean;
+	/**
+	 * The kernel process was hard-killed while this request was in flight,
+	 * so the namespace is gone. Output captured before the kill is still
+	 * present in `cells` — the whole point of surfacing this as a result
+	 * rather than an exception.
+	 */
+	killed?: boolean;
 }
 
 export interface KernelInfo {
@@ -86,7 +93,13 @@ interface PendingRequest {
 	requestedCells: CellRequest[];
 	cancelled: boolean;
 	timedOut: boolean;
+	killed?: boolean;
+	/** Fires at `timeoutMs`: marks the timeout and sends the first SIGINT. */
 	timer?: NodeJS.Timeout;
+	/** Fires at graceMs/2 after the timeout: second SIGINT. */
+	retryTimer?: NodeJS.Timeout;
+	/** Fires at graceMs after the timeout: SIGKILL. */
+	graceTimer?: NodeJS.Timeout;
 	cellsRun: number;
 	reset: boolean;
 	onUpdate?: (snapshot: ExecuteResult) => void;
@@ -143,13 +156,30 @@ export class PythonKernel {
 		proc.stdout.setEncoding("utf8");
 		proc.stderr.setEncoding("utf8");
 
-		proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
-		proc.stderr.on("data", (chunk: string) => this.onStderrOutOfBand(chunk));
+		// Every handler below is bound to THIS process object and must ignore
+		// events once it is no longer the live kernel.
+		//
+		// Node delivers a killed child's `exit` asynchronously, well after
+		// kill() returns. Without this guard the corpse's exit event lands on
+		// whatever is current by then — rejecting the *replacement* kernel's
+		// startup with "Python kernel exited (signal SIGKILL)", or failing a
+		// perfectly healthy in-flight request on the new process. That reads
+		// exactly like a kernel dying at random for no reason.
+		const isCurrent = () => this.proc === proc;
+
+		proc.stdout.on("data", (chunk: string) => {
+			if (isCurrent()) this.onStdout(chunk);
+		});
+		proc.stderr.on("data", (chunk: string) => {
+			if (isCurrent()) this.onStderrOutOfBand(chunk);
+		});
 
 		proc.on("error", (err) => {
+			if (!isCurrent()) return;
 			this.fail(err);
 		});
 		proc.on("exit", (code, signal) => {
+			if (!isCurrent()) return;
 			const reason = signal ? `signal ${signal}` : `exit code ${code}`;
 			this.exitReason = reason;
 			this.fail(new Error(`Python kernel exited (${reason})`));
@@ -313,6 +343,7 @@ export class PythonKernel {
 			timedOut: pending.timedOut,
 			cellsRun: pending.cellsRun,
 			reset: pending.reset,
+			...(pending.killed ? { killed: true } : {}),
 		};
 	}
 
@@ -320,6 +351,16 @@ export class PythonKernel {
 		if (pending.timer) {
 			clearTimeout(pending.timer);
 			pending.timer = undefined;
+		}
+		// The cell answered the SIGINT after all — disarm the escalation so
+		// we don't SIGKILL a kernel that just recovered.
+		if (pending.retryTimer) {
+			clearTimeout(pending.retryTimer);
+			pending.retryTimer = undefined;
+		}
+		if (pending.graceTimer) {
+			clearTimeout(pending.graceTimer);
+			pending.graceTimer = undefined;
 		}
 		const result = this.snapshot(pending);
 		this.pending = null;
@@ -405,13 +446,24 @@ export class PythonKernel {
 				// Send SIGINT first; the runner re-enables Python's default
 				// interrupt handler around each cell so the SIGINT becomes a
 				// KeyboardInterrupt the cell catches, returning cleanly with
-				// the namespace intact. If the cell doesn't return within
-				// `graceMs`, the kernel is genuinely wedged (e.g. a C
-				// extension that ignores signals) and we hard-kill so the
-				// user isn't stuck — that loses the namespace, which is the
-				// price of an unkillable cell.
+				// the namespace intact.
+				//
+				// A cell sitting inside a C extension (capstone, pysap,
+				// playwright, a blocking socket read) never reaches an
+				// interpreter check, so the first SIGINT does nothing. Send a
+				// second one midway through the grace period: Python-level
+				// loops that swallowed the first, and libraries that install
+				// their own handler, often act on the repeat.
 				if (graceMs > 0) {
-					setTimeout(() => {
+					pending.retryTimer = setTimeout(
+						() => {
+							if (this.pending === pending) this.interrupt();
+						},
+						Math.floor(graceMs / 2),
+					);
+					// Last resort. Costs the namespace, so the result carries
+					// `killed` and every byte captured so far.
+					pending.graceTimer = setTimeout(() => {
 						if (this.pending === pending) this.kill();
 					}, graceMs);
 				}
@@ -436,7 +488,12 @@ export class PythonKernel {
 			return await promise;
 		} finally {
 			if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
+			// All three must be cleared: the grace/retry timers outlive the
+			// timeout timer by design, and a stray one left armed keeps the
+			// event loop alive for up to graceMs after the call returned.
 			if (pending.timer) clearTimeout(pending.timer);
+			if (pending.retryTimer) clearTimeout(pending.retryTimer);
+			if (pending.graceTimer) clearTimeout(pending.graceTimer);
 		}
 	}
 
@@ -451,7 +508,17 @@ export class PythonKernel {
 		}
 	}
 
-	/** Hard-kill the kernel. The next execute() will respawn it. */
+	/**
+	 * Hard-kill the kernel. The next execute() will respawn it.
+	 *
+	 * If a request is in flight it is *resolved* with whatever output the
+	 * cells produced before the kill, flagged `killed`, rather than
+	 * rejected. Rejecting used to throw away every byte the cell had
+	 * printed — a 10-minute sweep that hung on its last HTTP call came back
+	 * as the bare string "python kernel killed" with all its findings
+	 * discarded. Partial output is usually the most valuable thing we have
+	 * at that point, so it must survive.
+	 */
 	kill(): void {
 		if (!this.proc) return;
 		try {
@@ -463,8 +530,11 @@ export class PythonKernel {
 		this.readyInfo = null;
 		this.readyPromise = null;
 		if (this.pending) {
-			this.pending.reject(new Error("python kernel killed"));
+			const pending = this.pending;
 			this.pending = null;
+			pending.killed = true;
+			pending.cancelled = true;
+			pending.resolve(this.snapshot(pending));
 		}
 	}
 

@@ -98,7 +98,14 @@ down the whole runner:
 * If the cell doesn't return within `interruptGraceMs` (default 30s,
   configurable) the kernel is hard-killed as a last resort — this
   catches genuinely wedged cases like a C extension that ignores
-  signals.
+  signals. A second SIGINT is sent halfway through the grace period
+  first — Python-level loops that swallowed the first one often act on
+  the repeat.
+* **A hard kill is not an error.** The call resolves with `killed: true`
+  and every byte the cells printed before the hang, not an exception.
+  Losing a long sweep's findings because its last HTTP call wedged is
+  worse than losing the kernel. The namespace *is* gone — the result
+  says so explicitly so the next call knows to re-run its setup.
   Set `interruptGraceMs: 0` to disable the auto-kill entirely (rely on
   `/python-restart` for truly wedged kernels).
 
@@ -267,6 +274,11 @@ a runnable interpreter.
   quitting pi all discard it. This is a deliberate trade against the old
   on-disk checkpointing; if you need state to outlive the process, write
   it to a file from inside a cell.
+* **`/tree` navigation does not touch the kernel.** Time travel rewinds
+  the conversation, not the interpreter — variables stay exactly as the
+  cells left them, so the namespace can legitimately contain things the
+  visible history hasn't produced yet. Use `/python-restart` when you
+  want the interpreter to match the rewound transcript.
 
 The architecture is borrowed in spirit from
 [oh-my-pi's IPython kernel runtime](https://github.com/can1357/oh-my-pi/blob/main/docs/python-repl.md),
