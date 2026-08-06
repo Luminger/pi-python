@@ -37,11 +37,63 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import signal
+
 import sys
 import time
 import traceback
 from typing import Any
+
+def _prune_foreign_pythonpath() -> list[str]:
+    """Drop ``sys.path`` entries built for a *different* Python version.
+
+    The host process passes its environment to the runner, ``PYTHONPATH``
+    included. That is right for a project path like ``src/`` and actively
+    harmful for anything version-specific: pi may be running under one
+    interpreter (say a nix shell whose ``PYTHONPATH`` lists a hundred
+    ``python3.13/site-packages`` directories) while the runner is a different
+    one (a ``.venv`` on 3.12, chosen by ``python_set_interpreter``).
+
+    Those entries are *prepended*, so they win. The failure is ugly and blames
+    the wrong thing: importing a package with a compiled component picks up the
+    foreign pure-Python half and the local ``.so``, and you get
+
+        Exception: Version mismatch: this is the 'cffi' package version 2.0.0,
+        located in '/nix/store/...-python3.13-cffi-2.0.0/...'. When we import
+        the top-level '_cffi_backend' extension module, we get version 2.1.1,
+        located in '.../.venv/lib/python3.12/...'
+
+    which names neither the interpreter mismatch nor ``PYTHONPATH``.
+
+    So: keep every entry that is not version-specific, and drop the ones whose
+    embedded ``pythonX.Y`` disagrees with this interpreter. Deliberately narrow
+    -- a plain source directory has no version in its path and survives.
+
+    Returns the dropped entries so the caller can report them.
+    """
+    ours = "%d.%d" % sys.version_info[:2]
+    pat = re.compile(r"[/\\]python(\d+\.\d+)[/\\]")
+    dropped: list[str] = []
+    kept: list[str] = []
+    for entry in sys.path:
+        found = pat.search(entry or "")
+        if found and found.group(1) != ours:
+            dropped.append(entry)
+        else:
+            kept.append(entry)
+    if dropped:
+        sys.path[:] = kept
+        # Also correct the variable itself, so a subprocess spawned from a cell
+        # (pytest, uv, a build) does not inherit the same broken path.
+        raw = os.environ.get("PYTHONPATH")
+        if raw:
+            parts = [p for p in raw.split(os.pathsep) if p not in set(dropped)]
+            if parts:
+                os.environ["PYTHONPATH"] = os.pathsep.join(parts)
+            else:
+                os.environ.pop("PYTHONPATH", None)
+    return dropped
 
 # Always frame on the original stdout, regardless of redirection.
 _RAW_STDOUT = sys.__stdout__
@@ -259,6 +311,10 @@ def _handle_request(state: dict[str, Any], msg: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    # Before anything else imports: a PYTHONPATH inherited from a host running
+    # a different interpreter would otherwise shadow this one's packages.
+    pruned = _prune_foreign_pythonpath()
+
     state: dict[str, Any] = {"ns": _make_namespace()}
 
     # SIGINT is the host's interrupt signal. Default for the runner is to
@@ -276,6 +332,9 @@ def main() -> int:
             "cwd": os.getcwd(),
             "pid": os.getpid(),
             "protocol": 2,
+            # Surfaced rather than silent: if an import later resolves somewhere
+            # unexpected, the first question is what was removed from the path.
+            "pruned_path_entries": len(pruned),
         }
     )
 
