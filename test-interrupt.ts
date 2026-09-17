@@ -1,7 +1,10 @@
 /**
  * End-to-end test for SIGINT-safe kernel behaviour.
  *
- * Drives a real PythonKernel through three scenarios:
+ * Drives a real PythonKernel through the relevant failure scenarios:
+ *   0. An ordinary Python exception is reported as a cell failure without
+ *      killing the kernel. State created before the exception — including
+ *      mutations earlier in the failed cell itself — remains available.
  *   1. A long-running cell is interrupted by `timeoutMs` → the cell
  *      reports timedOut+cancelled, and the kernel STAYS ALIVE. State
  *      established by previous cells in the same execute() call survives
@@ -39,6 +42,37 @@ async function main(): Promise<void> {
 	console.log(`kernel up (pid ${initialPid})`);
 
 	try {
+		// ── 0. Ordinary exception: same process and namespace survive ──
+		console.log("\n[0] ordinary exception preserves the kernel and namespace");
+		const ordinaryFailure = await k.execute(
+			[
+				{
+					code: [
+						"ordinary_marker = ['created']",
+						"ordinary_marker.append('mutated before failure')",
+						"raise RuntimeError('intentional test failure')",
+					].join("\n"),
+				},
+			],
+			{ timeoutMs: 5_000 },
+		);
+		check(ordinaryFailure.cells[0]?.ok === false, "ordinary exception reports ok=false");
+		check(
+			(ordinaryFailure.cells[0]?.exception ?? "").includes("RuntimeError: intentional test failure"),
+			"ordinary exception includes its traceback",
+		);
+		check(k.isAlive(), "kernel remains alive after an ordinary exception");
+		check(k.getInfo()?.pid === initialPid, `pid unchanged (${k.getInfo()?.pid})`);
+
+		const afterOrdinaryFailure = await k.execute(
+			[{ code: "ordinary_marker" }],
+			{ timeoutMs: 5_000 },
+		);
+		check(
+			afterOrdinaryFailure.cells[0]?.value === "['created', 'mutated before failure']",
+			`failed-cell mutations preserved (got ${JSON.stringify(afterOrdinaryFailure.cells[0]?.value)})`,
+		);
+
 		// ── 1. Multi-cell timeout: marker set, then long sleep gets SIGINT'd ──
 		console.log("\n[1] multi-cell call where cell 2 times out");
 		const r1 = await k.execute(
