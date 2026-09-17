@@ -69,9 +69,8 @@ ask the user to `/python-restart`.
 * **`settings.ts`** — Loader for `pi-python/settings.json` (global +
   project) and the `PI_PYTHON_*` env vars.
 * **`index.ts`** — Glue: registers the tools and slash commands, owns the
-  single kernel reference, hooks `session_tree` to kill the kernel when
-  the conversation moves to another branch, and tears down on
-  `session_shutdown`.
+  single kernel reference, and tears down on `session_shutdown`.
+  `session_tree` is deliberately *not* hooked — see *Known limitations*.
 
 Cells inside one `python` call run sequentially; if a cell raises, later
 cells are skipped (Jupyter notebook semantics). The trailing expression
@@ -186,9 +185,28 @@ In order of priority:
 absolute path to a binary or a bare command name on `PATH`. Directories
 are rejected with a hint pointing at the binary path inside.
 
-API-key-shaped env vars (`OPENAI_*`, `ANTHROPIC_*`, `*_API_KEY`,
-`*_TOKEN`, `*_SECRET`, etc.) are stripped from the subprocess env so
-LLM-generated code that reads `os.environ` can't exfiltrate them.
+## Security
+
+**This extension is not a security boundary.** It exists to run
+LLM-generated code, and that code executes with your full user
+privileges: your filesystem, your network, your SSH keys, your browser
+profiles, your cloud credentials. There is no sandbox, no syscall
+filter, and no allowlist. Run it only on code and in projects you would
+be willing to run by hand.
+
+As a shallow convenience measure, API-key-shaped env vars (`OPENAI_*`,
+`ANTHROPIC_*`, `*_API_KEY`, `*_TOKEN`, `*_SECRET`, etc.) are stripped
+from the subprocess environment. This is best-effort pattern matching
+against accidental leakage into a tool result — it is trivially defeated
+by a cell that reads `~/.config`, `~/.netrc`, or any credential file, and
+it must not be relied on as a control against hostile code.
+
+## Requirements
+
+* **Node** ≥ 22.19 (matches pi core; the test script additionally needs
+  Node's `--experimental-transform-types`).
+* **Python** ≥ 3.9 for the runner. No third-party packages are required —
+  a stock interpreter is enough.
 
 ## Install
 
@@ -233,7 +251,7 @@ pi -e ./index.ts
 ```ts
 {
   cells: Array<{ code: string; title?: string }>;  // ≥1
-  timeout?: number;   // seconds, default 120, clamped to 1..600
+  timeout?: number;   // seconds, default 120, clamped to 1..maxTimeoutSeconds (3600)
   reset?: boolean;    // drop the namespace before the first cell
   cwd?: string;       // working dir for this call
 }
@@ -279,6 +297,10 @@ a runnable interpreter.
   cells left them, so the namespace can legitimately contain things the
   visible history hasn't produced yet. Use `/python-restart` when you
   want the interpreter to match the rewound transcript.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 The architecture is borrowed in spirit from
 [oh-my-pi's IPython kernel runtime](https://github.com/can1357/oh-my-pi/blob/main/docs/python-repl.md),
