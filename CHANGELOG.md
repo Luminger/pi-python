@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/Luminger/pi-python/compare/v0.3.0...v0.3.1) (2026-09-17)
+
+
+### Chores
+
+* cut 0.3.1 to exercise the fixed publish path ([5a3cea6](https://github.com/Luminger/pi-python/commit/5a3cea6a35ed526643798f9ce9a10d63aa9d2cfd))
+
 ## [0.3.0](https://github.com/Luminger/pi-python/compare/v0.2.0...v0.3.0) (2026-09-17)
 
 
