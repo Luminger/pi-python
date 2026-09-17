@@ -1,0 +1,43 @@
+name: publish
+
+# Fires when release-please publishes a GitHub Release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required for npm trusted publishing (OIDC). No NPM_TOKEN is used, and
+  # npm generates provenance automatically for public repos published this
+  # way, so `--provenance` is not passed explicitly.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - run: npm ci
+
+      # The tarball ships TypeScript sources that pi type-strips at load
+      # time, so there is no build step to validate — the typecheck and the
+      # kernel suite are the gate.
+      - name: Typecheck
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Verify tarball contents
+        run: npm pack --dry-run
+
+      - name: Publish
+        run: npm publish
