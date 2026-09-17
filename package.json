@@ -1,7 +1,6 @@
 {
   "name": "pi-python",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "pi extension that exposes a persistent Python execution environment to the agent",
   "license": "MIT",
@@ -16,10 +15,20 @@
   "homepage": "https://github.com/Luminger/pi-python#readme",
   "keywords": [
     "pi",
+    "pi-package",
     "pi-extension",
     "python",
     "repl",
     "kernel"
+  ],
+  "files": [
+    "index.ts",
+    "kernel.ts",
+    "settings.ts",
+    "runner.py",
+    "README.md",
+    "SECURITY.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=22.19.0"
@@ -35,7 +44,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.2",
