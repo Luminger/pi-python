@@ -210,6 +210,28 @@ it must not be relied on as a control against hostile code.
 
 ## Install
 
+```bash
+pi install npm:pi-python
+```
+
+Or pin a version, which opts out of `pi update --extensions`:
+
+```bash
+pi install npm:pi-python@0.2.0
+```
+
+To try it for a single run without installing:
+
+```bash
+pi -e npm:pi-python
+```
+
+Then `/reload` inside pi (or restart). `/python-status` confirms it is
+loaded; so does the `--python <path>` flag showing up in `pi --help`,
+since this extension registers it.
+
+### From a clone
+
 The repo doubles as the extension package, so `npm install` here pulls in
 the typings and dev tooling, and `npm run check` typechecks the TS
 files. `npm test` runs the end-to-end interrupt/timeout suite (no mocks;
@@ -221,7 +243,7 @@ npm run check
 npm test
 ```
 
-For pi to pick the extension up, place this directory under one of pi's
+For pi to pick a clone up, place the directory under one of pi's
 auto-discovery roots:
 
 ```bash
@@ -233,12 +255,7 @@ mkdir -p .pi/extensions
 ln -s "$(pwd)" .pi/extensions/pi-python
 ```
 
-Then `/reload` inside pi (or restart). `/python-status` will confirm
-it's loaded. The `--python <path>` flag in `pi --help` is also a quick
-check — it's registered by this extension, so its presence means
-pi-python loaded.
-
-For one-off testing without installing:
+For one-off testing of a clone:
 
 ```bash
 pi -e ./index.ts
@@ -297,6 +314,34 @@ a runnable interpreter.
   cells left them, so the namespace can legitimately contain things the
   visible history hasn't produced yet. Use `/python-restart` when you
   want the interpreter to match the rewound transcript.
+
+## Versioning and releases
+
+`0.x`, and staying there. Nothing here is a stability promise — tool
+names, parameters, result formatting, and defaults change whenever a
+better shape turns up.
+
+The agent-facing surface is the *cheapest* part to change, not the most
+expensive. The model re-reads the tool schema every session; rename
+`cells` to `blocks` tomorrow and it simply adapts. Nobody has code
+calling this by hand, so treating tool signatures as an API contract
+would be cargo-culting semver at a consumer that doesn't need it.
+
+What actually warrants a `!` / `BREAKING CHANGE:` trailer is anything
+that silently breaks a working install:
+
+* `settings.json` keys and `PI_PYTHON_*` env vars being renamed or dropped
+* a change in interpreter resolution order, so a different python gets picked
+* raising the Node or Python floor
+* a change to whether the namespace survives some event
+
+Version numbers exist so `pi update --extensions` has something to
+compare, and so a bad release can be pinned around. Releases are
+generated from [Conventional
+Commits](https://www.conventionalcommits.org/en/v1.0.0/) by
+release-please and published to npm from CI with trusted publishing, so
+each one carries provenance. See [CONTRIBUTING.md](CONTRIBUTING.md) and
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
