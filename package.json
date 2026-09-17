@@ -4,6 +4,26 @@
   "private": true,
   "type": "module",
   "description": "pi extension that exposes a persistent Python execution environment to the agent",
+  "license": "MIT",
+  "author": "Simon Brakhane <simon@brakhane.net>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Luminger/pi-python.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Luminger/pi-python/issues"
+  },
+  "homepage": "https://github.com/Luminger/pi-python#readme",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "python",
+    "repl",
+    "kernel"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
