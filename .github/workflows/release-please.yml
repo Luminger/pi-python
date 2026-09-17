@@ -13,17 +13,63 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       # Maintains a rolling "chore(main): release x.y.z" PR built from the
       # conventional commits on main. Merging it bumps package.json, writes
-      # CHANGELOG.md, tags vX.Y.Z, and publishes a GitHub Release — which is
-      # what triggers publish.yml.
+      # CHANGELOG.md, tags vX.Y.Z, and publishes a GitHub Release.
       #
       # GITHUB_TOKEN is deliberate: CI checks will not run on the release PR
-      # as a result. That is acceptable because every commit reaching main
-      # already passed CI, and the release PR only touches the version and
-      # changelog. Swap in a PAT if you ever want checks on it.
+      # as a result. Every commit reaching main already passed CI, and the
+      # publish job below re-tests the tagged commit anyway.
       - uses: googleapis/release-please-action@v5
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  # Publishing lives here rather than in its own `on: release` workflow
+  # because a release created with GITHUB_TOKEN does not trigger further
+  # workflow runs — the same restriction that withholds checks from the
+  # release PR. A separate publish workflow simply never fires. Running in
+  # this job works because this run was triggered by a human push to main.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm trusted publishing (OIDC). No NPM_TOKEN is used,
+      # and npm generates provenance automatically for public repos on this
+      # path, so `--provenance` is not passed explicitly.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Build exactly what was tagged, not whatever main has drifted to.
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - run: npm ci
+
+      # The tarball ships TypeScript sources that pi type-strips at load
+      # time, so there is no build step to validate — the typecheck and the
+      # kernel suite are the gate.
+      - name: Typecheck
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Verify tarball contents
+        run: npm pack --dry-run
+
+      - name: Publish
+        run: npm publish

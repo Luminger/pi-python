@@ -67,12 +67,19 @@ Releases are automated and nobody bumps a version by hand.
 2. `release-please` maintains a rolling release PR containing the version
    bump and generated `CHANGELOG.md`.
 3. Merging that PR tags `vX.Y.Z` and publishes a GitHub Release.
-4. The release event triggers `publish.yml`, which runs the typecheck and
-   tests once more and publishes to npm via trusted publishing (OIDC).
+4. The same workflow run then checks out the tag, re-runs the typecheck
+   and tests, and publishes to npm via trusted publishing (OIDC).
+
+Step 4 lives in `release-please.yml` rather than a separate `on: release`
+workflow for a reason worth not rediscovering: a release created with the
+built-in `GITHUB_TOKEN` does not trigger further workflow runs, so a
+dedicated publish workflow never fires at all. Publishing from the run
+that created the release sidesteps that, because that run was started by
+a human push to `main`.
 
 No npm token exists in the repository. Publishing authority is bound to
-the `publish.yml` workflow in this repo through npm's trusted publisher
-configuration, and npm attaches provenance automatically.
+the `release-please.yml` workflow in this repo through npm's trusted
+publisher configuration, and npm attaches provenance automatically.
 
 **Caveat on the release PR.** GitHub does not run workflows for PRs opened
 with the built-in `GITHUB_TOKEN`, which is what release-please uses. Its
@@ -83,7 +90,7 @@ the required checks never report. Two ways through:
   normally once the four legs pass.
 * Or merge it as an admin, which the protection rules allow.
 
-Neither skips testing: `publish.yml` re-runs the typecheck and the full
+Neither skips testing: the publish job re-runs the typecheck and the full
 kernel suite against the tagged commit before it publishes, so an
 unapproved release PR cannot ship untested code.
 
@@ -105,4 +112,5 @@ without the user doing anything:
 * raising the Node or Python floor
 * changing whether the namespace survives a given event
 
-While `0.x`, those bump the minor.
+While `0.x`, those bump the minor. Everything else — features included —
+bumps the patch, so ordinary releases are `0.3.1`, `0.3.2`, and so on.
