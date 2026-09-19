@@ -2,7 +2,7 @@
   "name": "pi-python",
   "version": "0.3.1",
   "type": "module",
-  "description": "pi extension that exposes a persistent Python execution environment to the agent",
+  "description": "Persistent IPython-style Python session for the pi coding agent",
   "license": "MIT",
   "author": "Simon Brakhane <simon@brakhane.net>",
   "repository": {
@@ -18,6 +18,8 @@
     "pi-package",
     "pi-extension",
     "python",
+    "ipython",
+    "notebook",
     "repl",
     "kernel"
   ],
