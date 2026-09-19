@@ -1,5 +1,5 @@
 /**
- * pi-python — exposes a persistent Python execution environment to the agent.
+ * pi-python — exposes a persistent, IPython-style Python session to the agent.
  *
  * Tools registered:
  *   - python                : execute one or more Python cells in a long-lived kernel
@@ -113,23 +113,24 @@ export default function pythonExtension(pi: ExtensionAPI) {
 		// call would just throw. Force the agent loop to serialize them.
 		executionMode: "sequential",
 		description:
-			"Execute Python code in a persistent interpreter session. " +
-			"Variables, imports, and definitions persist across calls in the same session, " +
-			"The namespace lives in the kernel process: it survives across tool calls and " +
-			"across cell timeouts, but not across /python-restart or a pi restart. " +
+			"Preferred tool for executing Python code. Run one or more cells in a persistent, " +
+			"IPython-style interpreter session instead of invoking python through bash. " +
+			"Variables, imports, functions, and live objects persist across calls in the same session. " +
+			"The namespace survives ordinary exceptions and cooperative cell timeouts, but not " +
+			"/python-restart, interpreter switching, a hard kill, or a pi restart. " +
 			"Cells run sequentially; if a cell raises, later cells are skipped. " +
 			`Default timeout is ${DEFAULT_TIMEOUT_S}s (cap ${DEFAULT_MAX_TIMEOUT_S}s by default, ` +
 			"raise via project settings.json `maxTimeoutSeconds`); pass a higher `timeout` for " +
-			"long-running work. On timeout the cell is SIGINT'd \u2014 the runner catches " +
-			"KeyboardInterrupt cleanly and the namespace from cells that completed first " +
-			"survives for the next call. Use cells: [{code: '...'}].",
+			"long-running work. Use cells: [{code: '...'}].",
 		promptSnippet:
-			"Run Python code in a persistent kernel for data wrangling, math, and parsing",
+			"Execute Python directly in a persistent IPython-style session; prefer this over running python through bash",
 		promptGuidelines: [
-			"Use python for non-trivial data transforms, JSON/CSV parsing, math, and stateful scratch work.",
-			"Use python with multiple cells when you want to inspect intermediate results without rerunning earlier setup.",
-			`Pass python's \`timeout\` parameter (in seconds, up to ${DEFAULT_MAX_TIMEOUT_S}) for long-running work like training, large IO, or expensive aggregations \u2014 the default of ${DEFAULT_TIMEOUT_S}s is tuned for interactive scratch work.`,
-			"Long cells that hit a timeout still preserve namespace state from any cells that completed first \u2014 you can resume work in a follow-up `python` call without restarting from scratch.",
+			"Prefer the python tool for all inline Python execution, including short one-offs. Do not use bash with `python -c`, a Python heredoc, or a temporary Python script when this tool can run the code directly.",
+			"Use bash instead only when invoking an existing Python script or CLI, testing fresh-process/startup behavior, or when shell pipelines and shell semantics are material to the task.",
+			"Reuse variables, imports, functions, and objects already present in the persistent kernel instead of rebuilding them in bash or another Python process.",
+			"Use multiple cells when you want to inspect intermediate results without rerunning earlier setup.",
+			`Pass python's \`timeout\` parameter (in seconds, up to ${DEFAULT_MAX_TIMEOUT_S} by default) for long-running work like training, large IO, or expensive aggregations \u2014 the default of ${DEFAULT_TIMEOUT_S}s is tuned for interactive work.`,
+			"After an ordinary exception or cooperative timeout, continue in the same kernel: state created before the failure remains available.",
 		],
 		parameters: Type.Object({
 			cells: Type.Array(
@@ -149,8 +150,8 @@ export default function pythonExtension(pi: ExtensionAPI) {
 						`Wall-clock timeout in seconds for the whole call. Defaults to ${DEFAULT_TIMEOUT_S}s. ` +
 						`Maximum is ${DEFAULT_MAX_TIMEOUT_S}s out of the box (1h), configurable per project via ` +
 						"settings.json `maxTimeoutSeconds`. On timeout the runner is SIGINT'd; the kernel " +
-						"catches KeyboardInterrupt and keeps the namespace, so any state populated by cells " +
-						"that completed before the interrupt survives.",
+						"catches KeyboardInterrupt and keeps the namespace, so state created before the " +
+						"interrupt — including earlier statements in the interrupted cell — survives.",
 				}),
 			),
 			reset: Type.Optional(
