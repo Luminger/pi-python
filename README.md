@@ -138,6 +138,10 @@ marked `killed` and includes every byte printed before termination. Set
 `interruptGraceMs` to `0` to disable automatic hard kills and rely on
 `/python-restart` for wedged kernels.
 
+On Windows, Node cannot deliver a catchable SIGINT to a child process. A timeout
+therefore hard-kills the kernel immediately, preserving partial output but not
+the namespace.
+
 For long work, use multiple cells: completed setup cells remain available if a
 later cell times out.
 

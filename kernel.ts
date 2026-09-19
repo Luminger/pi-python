@@ -466,8 +466,16 @@ export class PythonKernel {
 		}
 	}
 
-	/** Send SIGINT to interrupt the currently running cell. */
+	/** Interrupt the current cell, preserving the kernel where the OS permits it. */
 	interrupt(): void {
+		// Node cannot deliver a catchable SIGINT to a Windows child: kill("SIGINT")
+		// terminates it outright and the exit event rejects the request before we can
+		// return a useful result. Make that unavoidable hard kill explicit instead,
+		// preserving partial output and reporting `killed: true` consistently.
+		if (process.platform === "win32") {
+			this.kill();
+			return;
+		}
 		if (this.proc && this.proc.exitCode === null) {
 			try {
 				this.proc.kill("SIGINT");

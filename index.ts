@@ -149,9 +149,9 @@ export default function pythonExtension(pi: ExtensionAPI) {
 					description:
 						`Wall-clock timeout in seconds for the whole call. Defaults to ${DEFAULT_TIMEOUT_S}s. ` +
 						`Maximum is ${DEFAULT_MAX_TIMEOUT_S}s out of the box (1h), configurable per project via ` +
-						"settings.json `maxTimeoutSeconds`. On timeout the runner is SIGINT'd; the kernel " +
-						"catches KeyboardInterrupt and keeps the namespace, so state created before the " +
-						"interrupt — including earlier statements in the interrupted cell — survives.",
+						"settings.json `maxTimeoutSeconds`. On POSIX, timeout sends SIGINT and the kernel " +
+						"keeps state created before KeyboardInterrupt, including earlier statements in the " +
+						"interrupted cell. On Windows, timeout hard-kills the process and loses the namespace.",
 				}),
 			),
 			reset: Type.Optional(
