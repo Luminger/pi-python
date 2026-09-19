@@ -38,8 +38,10 @@ function check(condition: boolean, label: string): void {
 
 async function main(): Promise<void> {
 	const envMarker = "inherited-from-pi-host";
+	const pythonPath = process.env.PI_PYTHON_TEST_INTERPRETER ??
+		(process.platform === "win32" ? "python.exe" : "python3");
 	const k = new PythonKernel({
-		pythonPath: "python3",
+		pythonPath,
 		cwd: process.cwd(),
 		env: { ...process.env, PI_PYTHON_ENV_INHERITANCE_TEST: envMarker },
 	});

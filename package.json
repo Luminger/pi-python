@@ -31,7 +31,8 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "bun": ">=1.3.0"
   },
   "pi": {
     "extensions": [
@@ -40,7 +41,8 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --experimental-transform-types --no-warnings test-interrupt.ts"
+    "test": "node --experimental-transform-types --no-warnings test-interrupt.ts",
+    "test:bun": "bun test-interrupt.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

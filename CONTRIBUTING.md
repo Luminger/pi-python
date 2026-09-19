@@ -3,7 +3,7 @@
 ## Local setup
 
 ```bash
-npm install
+npm ci
 npm run check   # tsc --noEmit
 npm test        # drives a real PythonKernel, no mocks
 ```
@@ -23,26 +23,34 @@ pi -e ./index.ts
 
 * Node ≥ 22.19 (pi core's floor; the test script needs
   `--experimental-transform-types`).
+* Bun ≥ 1.3 when using Bun as the TypeScript host.
 * Python ≥ 3.9 for `runner.py`, stdlib only.
 
-CI runs the matrix ends: Node 22.19 and 24, each against Python 3.9 and
-3.13. If you rely on a newer Python feature in `runner.py`, raise the floor
-in the CI matrix, `README.md`, and this file in the same commit.
+CI cross-products every claimed Python version (3.9–3.14), every modern
+supported Node line (22, 24, 26, plus the exact 22.19 floor), Bun 1.3 and
+1.4, and all three GitHub-hosted OS families (Linux, macOS, Windows): 108
+jobs per run. Python 3.9 remains despite upstream EOL because it is still
+the documented floor.
+
+When changing a runtime floor or support range, update `package.json`, the
+CI matrix, `README.md`, and this file together.
 
 ## Commit messages
 
-[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) are
-required, because releases are generated from them. The type drives the
-version bump and the changelog:
+Commits landing on `main` must use [Conventional
+Commits](https://www.conventionalcommits.org/en/v1.0.0/), because
+release-please generates versions and changelogs from them. For squash
+merges, the PR title becomes that commit message and must follow the
+convention. The type drives the version bump and changelog section:
 
 | Prefix | Changelog section | Bump (pre-1.0) |
 | --- | --- | --- |
-| `feat:` | Features | minor |
+| `feat:` | Features | patch |
 | `fix:` | Bug Fixes | patch |
 | `perf:` | Performance | patch |
 | `refactor:` | Refactoring | patch |
 | `docs:` | Documentation | patch |
-| `test:`, `build:`, `ci:`, `chore:` | hidden | patch |
+| `test:`, `build:`, `ci:`, `chore:` | hidden | no release on their own |
 | any type with `!` or `BREAKING CHANGE:` | Breaking | minor while 0.x |
 
 Write the body for someone who has to touch the same code in a year.
@@ -53,8 +61,9 @@ justified the change. The existing history is the style reference.
 
 `main` requires a PR (0 approvals — review is encouraged, not enforced for
 a project this size), a linear history, resolved conversations, and the
-four CI legs passing. Force pushes and deletion are blocked. Admins are
-not bound by the rules, deliberately: see the release caveat below.
+`CI gate` check. That stable gate succeeds only when the entire dynamic
+runtime/OS matrix passes. Force pushes and deletion are blocked. Admins
+are not bound by the rules, deliberately: see the release caveat below.
 
 Because linear history is required, merge commits are disabled repo-wide.
 Squash and rebase merges both work.
@@ -87,7 +96,7 @@ PR therefore shows a CI run stuck at `action_required` with no jobs, and
 the required checks never report. Two ways through:
 
 * Open the run in the Actions tab and click *Approve and run*, then merge
-  normally once the four legs pass.
+  normally once the full matrix and `CI gate` pass.
 * Or merge it as an admin, which the protection rules allow.
 
 Neither skips testing: the publish job re-runs the typecheck and the full
@@ -95,7 +104,8 @@ kernel suite against the tagged commit before it publishes, so an
 unapproved release PR cannot ship untested code.
 
 Wiring a PAT into release-please would make checks run on its PR, at the
-cost of a long-lived credential in the repository. Not worth it here.
+cost of maintaining a long-lived repository secret. One explicit approval
+per release is the simpler tradeoff here.
 
 ## What counts as breaking
 
