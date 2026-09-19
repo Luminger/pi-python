@@ -43,7 +43,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node test-node.mjs",
+    "test": "node --no-warnings test-interrupt.ts",
     "test:bun": "bun test-interrupt.ts"
   },
   "peerDependencies": {

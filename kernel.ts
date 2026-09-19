@@ -74,6 +74,7 @@ interface PendingRequest {
 }
 
 export class PythonKernel {
+	private readonly options: KernelOptions;
 	private proc: ChildProcessWithoutNullStreams | null = null;
 	private buffer = "";
 	private pending: PendingRequest | null = null;
@@ -84,7 +85,9 @@ export class PythonKernel {
 	private exitReason: string | null = null;
 	private nextRequestId = 1;
 
-	constructor(private readonly options: KernelOptions) {}
+	constructor(options: KernelOptions) {
+		this.options = options;
+	}
 
 	getInfo(): KernelInfo | null {
 		return this.readyInfo;
