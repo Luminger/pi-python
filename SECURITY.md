@@ -1,54 +1,41 @@
 # Security Policy
 
-## Threat model, stated plainly
+## Threat model
 
-pi-python exists to execute code written by a language model on your
-machine. Arbitrary code execution is the **feature**, not a
-vulnerability. The extension spawns a normal `python3` subprocess with
-your user's privileges and pipes code into it. There is no sandbox, no
-container, no seccomp filter, no import allowlist, and no filesystem
-restriction.
+Installing pi-python gives the active LLM arbitrary code execution as the user
+running pi. The model supplies and invokes the code without per-cell approval.
+There is no sandbox, and the Python process inherits pi's environment unchanged.
+The model can do anything that user can do.
 
-A cell can therefore read your SSH keys, exfiltrate data over the
-network, delete files, and spawn further processes. This is inherent to
-what the tool does. Use it only where you would be comfortable running
-the same code by hand.
+Model mistakes, prompt injection, and malicious instructions all operate within
+that same authority. pi-python cannot make arbitrary model-driven execution safe
+from inside the process being controlled.
 
-The environment-variable filter in `kernel.ts` (`filterEnv`) strips
-API-key-shaped variables from the subprocess environment. It exists to
-reduce *accidental* credential leakage into a tool result that then goes
-back to a model provider. It is pattern matching, it is best-effort, and
-it is not a control against deliberately hostile code — anything that
-reads a credential file bypasses it entirely.
+If this authority is too broad, restrict it outside pi-python: run pi under a
+dedicated account, container, VM, sandbox, or other OS-level boundary.
 
-## What counts as a reportable vulnerability
+## What counts as a vulnerability
 
-Because the above is by design, a report is in scope when the extension
-does something a user could not reasonably expect, such as:
+Arbitrary execution through an accepted `python` tool call is the intended
+capability. Reports are in scope when pi-python exceeds or misrepresents that
+boundary—for example by executing without a corresponding tool call, crossing
+session boundaries, using a different interpreter than reported, persisting or
+transmitting cell data on its own, accepting forged protocol messages, or
+escalating beyond the OS identity running pi.
 
-* Code executing when no `python` tool call was made, or after the kernel
-  was supposed to be shut down.
-* The kernel being spawned with a different interpreter than the one
-  resolution rules and `/python-status` report.
-* Credentials or namespace contents being written somewhere not
-  documented (the extension deliberately persists nothing to disk).
-* A crash or protocol confusion in the NDJSON framing that lets cell
-  output forge control messages to the host.
-* Privilege escalation beyond the invoking user.
-
-Out of scope: "a cell can read `/etc/passwd`", "a cell can make network
-requests", "the env filter can be bypassed by reading a file", and
-similar restatements of the documented design.
+The fact that the model can exercise the authority of the user running pi,
+including after prompt injection, is not a bypass in pi-python; it is the
+documented security model.
 
 ## Reporting
 
-Please report suspected vulnerabilities privately via GitHub's
+Please report suspected vulnerabilities privately through GitHub's
 [security advisory form](https://github.com/Luminger/pi-python/security/advisories/new)
 rather than a public issue.
 
-Include the pi version, the extension commit, your OS and Python version,
-and a minimal reproduction. Expect an initial response within a couple of
-weeks — this is a spare-time project, not a funded one.
+Include the pi version, pi-python version or commit, OS and Python version, and a
+minimal reproduction. Expect an initial response within a couple of weeks; this
+is a spare-time project, not a funded service.
 
 ## Supported versions
 

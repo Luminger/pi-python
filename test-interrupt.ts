@@ -1,7 +1,9 @@
 /**
  * End-to-end test for SIGINT-safe kernel behaviour.
  *
- * Drives a real PythonKernel through the relevant failure scenarios:
+ * Drives a real PythonKernel through the relevant failure scenarios and
+ * verifies that the selected interpreter receives the host environment
+ * unchanged:
  *   0. An ordinary Python exception is reported as a cell failure without
  *      killing the kernel. State created before the exception — including
  *      mutations earlier in the failed cell itself — remains available.
@@ -35,13 +37,28 @@ function check(condition: boolean, label: string): void {
 }
 
 async function main(): Promise<void> {
-	const k = new PythonKernel({ pythonPath: "python3", cwd: process.cwd() });
+	const envMarker = "inherited-from-pi-host";
+	const k = new PythonKernel({
+		pythonPath: "python3",
+		cwd: process.cwd(),
+		env: { ...process.env, PI_PYTHON_ENV_INHERITANCE_TEST: envMarker },
+	});
 	await k.start();
 	const initialPid = k.getInfo()?.pid;
 	if (!initialPid) throw new Error("no initial pid");
 	console.log(`kernel up (pid ${initialPid})`);
 
 	try {
+		console.log("\n[env] host environment is inherited unchanged");
+		const inheritedEnv = await k.execute(
+			[{ code: "import os\nos.environ['PI_PYTHON_ENV_INHERITANCE_TEST']" }],
+			{ timeoutMs: 5_000 },
+		);
+		check(
+			inheritedEnv.cells[0]?.value === `'${envMarker}'`,
+			`custom host variable is visible (got ${JSON.stringify(inheritedEnv.cells[0]?.value)})`,
+		);
+
 		// ── 0. Ordinary exception: same process and namespace survive ──
 		console.log("\n[0] ordinary exception preserves the kernel and namespace");
 		const ordinaryFailure = await k.execute(

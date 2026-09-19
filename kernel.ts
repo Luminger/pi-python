@@ -10,38 +10,6 @@ import { fileURLToPath } from "node:url";
 
 const RUNNER_PATH = join(dirname(fileURLToPath(import.meta.url)), "runner.py");
 
-/** Provider/secret env vars stripped before launching python. */
-const ENV_DENYLIST_PREFIXES = [
-	"OPENAI_",
-	"ANTHROPIC_",
-	"GEMINI_",
-	"GOOGLE_API",
-	"GOOGLE_GENERATIVE",
-	"GROQ_",
-	"MISTRAL_",
-	"XAI_",
-	"DEEPSEEK_",
-	"COHERE_",
-	"PERPLEXITY_",
-	"TOGETHER_",
-	"FIREWORKS_",
-	"OPENROUTER_",
-	"AZURE_OPENAI",
-	"HUGGINGFACE_",
-	"HF_TOKEN",
-	"REPLICATE_",
-	"AWS_SECRET",
-	"AWS_SESSION",
-];
-
-const ENV_DENYLIST_EXACT = new Set([
-	"GITHUB_TOKEN",
-	"GH_TOKEN",
-	"NPM_TOKEN",
-	"NPM_PASSWORD",
-	"PI_API_KEY",
-]);
-
 export interface CellRequest {
 	code: string;
 	title?: string;
@@ -137,9 +105,10 @@ export class PythonKernel {
 		if (this.readyInfo) return this.readyInfo;
 		if (this.readyPromise) return this.readyPromise;
 
-		const env = filterEnv(this.options.env ?? process.env);
-		// Make sure cwd ends up in sys.path (runner does this too, belt + braces).
-		env.PYTHONUNBUFFERED = "1";
+		// Python is a first-class execution environment, not a sandbox. Inherit
+		// the host environment unchanged so project tooling and credentials work
+		// exactly as they do from the user's shell.
+		const env = { ...(this.options.env ?? process.env), PYTHONUNBUFFERED: "1" };
 
 		const proc = spawn(this.options.pythonPath, ["-u", RUNNER_PATH], {
 			cwd: this.options.cwd,
@@ -559,21 +528,6 @@ export class PythonKernel {
 		this.readyInfo = null;
 		this.readyPromise = null;
 	}
-}
-
-/** Build the env handed to the python subprocess, stripping likely secrets. */
-export function filterEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-	const out: NodeJS.ProcessEnv = {};
-	for (const [key, value] of Object.entries(source)) {
-		if (value === undefined) continue;
-		if (ENV_DENYLIST_EXACT.has(key)) continue;
-		if (ENV_DENYLIST_PREFIXES.some((prefix) => key.startsWith(prefix))) continue;
-		if (/_API_KEY$/i.test(key)) continue;
-		if (/_SECRET$/i.test(key)) continue;
-		if (/_TOKEN$/i.test(key)) continue;
-		out[key] = value;
-	}
-	return out;
 }
 
 /**
