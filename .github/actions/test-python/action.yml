@@ -1,0 +1,35 @@
+name: Test one Python version
+description: Run the kernel suite against one Python version and the selected JS host
+
+inputs:
+  python-version:
+    description: Python version for actions/setup-python
+    required: true
+  runtime-kind:
+    description: node or bun
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Report Python
+      shell: bash
+      run: python --version
+
+    - name: Test under Node
+      if: inputs.runtime-kind == 'node'
+      shell: bash
+      run: npm test
+      env:
+        PI_PYTHON_TEST_INTERPRETER: python
+
+    - name: Test under Bun
+      if: inputs.runtime-kind == 'bun'
+      shell: bash
+      run: npm run test:bun
+      env:
+        PI_PYTHON_TEST_INTERPRETER: python

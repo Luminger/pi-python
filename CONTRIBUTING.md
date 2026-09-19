@@ -29,8 +29,9 @@ pi -e ./index.ts
 CI cross-products every claimed Python version (3.9–3.14), every modern
 supported Node line (22, 24, 26, plus the exact 22.19 floor), Bun 1.3 and
 1.4, and all three GitHub-hosted OS families (Linux, macOS, Windows): 108
-jobs per run. Python 3.9 remains despite upstream EOL because it is still
-the documented floor.
+combinations. Python versions run sequentially inside each runtime/OS job,
+so GitHub shows 18 matrix checks rather than 108. Python 3.9 remains
+despite upstream EOL because it is still the documented floor.
 
 When changing a runtime floor or support range, update `package.json`, the
 CI matrix, `README.md`, and this file together.
