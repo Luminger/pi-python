@@ -11,5 +11,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "kernel.ts", "settings.ts", "test-interrupt.ts"]
+  "include": ["index.ts", "kernel.ts", "settings.ts", "test-interrupt.ts", "test-settings.ts"]
 }
