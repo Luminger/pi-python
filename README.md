@@ -1,354 +1,287 @@
 # pi-python
 
-A pi extension that gives the agent a persistent Python execution
-environment.
+[![npm version](https://img.shields.io/npm/v/pi-python?color=cb3837&logo=npm)](https://www.npmjs.com/package/pi-python)
+[![npm downloads](https://img.shields.io/npm/dm/pi-python?color=cb3837&logo=npm)](https://www.npmjs.com/package/pi-python)
+[![CI](https://github.com/Luminger/pi-python/actions/workflows/ci.yml/badge.svg)](https://github.com/Luminger/pi-python/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/pi-python)](LICENSE)
 
-Spawns one long-lived `python3 -u` subprocess per pi session, lazily on
-first use. Variables, imports, and definitions live in that process and
-persist across tool calls for as long as it does.
+**An IPython-style Python session, made available as a tool to the
+[pi](https://github.com/earendil-works/pi) coding agent.**
 
-The namespace is deliberately **not** persisted to disk. An earlier
-version pickled the whole namespace after every call so kernel restarts
-and `/tree` navigation could resurrect it; in practice the restores were
-rarely useful, while the snapshots cost a full serialization per call and
-grew to 80 GB across 421 sessions. Re-running the cells is cheaper and
-more predictable. See *Known limitations*.
+pi-python gives the agent a notebook-style Python session instead of a sequence
+of isolated `python -c` invocations. The agent submits cells to one long-lived
+interpreter, sees streaming stdout and stderr plus the value of the final
+expression, and keeps the resulting namespace for the next call. Imports,
+variables, functions, classes, and live Python objects remain in memory while the
+pi session continues.
 
-## Tools the agent sees
-
-| Tool | What it does |
-| ---- | ------------ |
-| `python` | Run one or more Python cells in the persistent kernel. Variables, imports, and definitions persist across calls for the life of the kernel process. Default timeout 120s, max 3600s (configurable via `maxTimeoutSeconds`). On timeout the runner is SIGINT'd; the kernel catches KeyboardInterrupt and the namespace from any cells that completed before the interrupt survives. |
-| `python_set_interpreter` | Switch the kernel to a different python interpreter binary (e.g. `/path/to/.venv/bin/python` or `python3.12`). Kills the current kernel and spawns a new one, so the namespace is wiped. |
-
-Both tools are registered with `executionMode: "sequential"` so the agent
-never tries to run two cells (or a cell and an interpreter switch)
-concurrently against the same kernel.
-
-There is intentionally **no** `python_reset` tool. If the agent needs a
-clean namespace it can call `python_set_interpreter` with the same path
-(which discards state by design), run `globals().clear()` in a cell, or
-ask the user to `/python-restart`.
-
-## Slash commands the user sees
-
-| Command | What it does |
-| ------- | ------------ |
-| `/python-status` | Kernel info (executable, pid, cwd, alive) + active settings with their source. |
-| `/python-restart` | Kill and respawn the kernel — interrupts a hung cell. The namespace is discarded; re-run the cells you still need. |
-
-## CLI flags
-
-```
---python <path>     Override the interpreter pi-python should use.
-                    Either an absolute path (/path/to/.venv/bin/python) or a
-                    bare command name (python3.12) resolvable on PATH.
-                    Smoke-tested at session_start; bad values are reported
-                    and ignored (default resolution kicks in instead).
-```
-
-## How it works
-
-```
-┌──────────────┐   NDJSON over stdio   ┌──────────────────┐
-│  pi (host)   │  ──────────────────▶  │  python3 runner  │
-│  index.ts    │  ◀──────────────────  │  runner.py       │
-│  kernel.ts   │     stream events     │  (persistent ns) │
-│  settings.ts │                       └──────────────────┘
-└──────────────┘
-```
-
-* **`runner.py`** — Python subprocess that reads NDJSON requests on stdin
-  (`execute`) and emits framed events on stdout.
-  User code that prints is captured by replacing `sys.stdout` /
-  `sys.stderr` with stream writers; control messages always go through
-  `sys.__stdout__`.
-* **`kernel.ts`** — Owns the subprocess. Parses the NDJSON stream, supports
-  cancellation via `SIGINT`, respawns after a hard kill, exposes typed
-  `execute()`, and validates interpreter paths.
-* **`settings.ts`** — Loader for `pi-python/settings.json` (global +
-  project) and the `PI_PYTHON_*` env vars.
-* **`index.ts`** — Glue: registers the tools and slash commands, owns the
-  single kernel reference, and tears down on `session_shutdown`.
-  `session_tree` is deliberately *not* hooked — see *Known limitations*.
-
-Cells inside one `python` call run sequentially; if a cell raises, later
-cells are skipped (Jupyter notebook semantics). The trailing expression
-of a cell, if any, has its `repr()` shown — same as a notebook cell.
-
-## Interrupt model
-
-The kernel is designed to **survive timeouts**. SIGINT handling is
-routed carefully so a runaway cell can be interrupted without taking
-down the whole runner:
-
-* At startup the runner installs `SIG_IGN` for `SIGINT`. The main
-  loop, `sys.stdin` readline, and between-cell bookkeeping all ignore
-  the signal.
-* During `_run_cell` only, the runner installs Python's default
-  `SIGINT` handler (which raises `KeyboardInterrupt`). On entry to
-  the next cell the previous handler is restored unconditionally so
-  a buggy cell can't un-protect the runner.
-* `kernel.execute()` sends `SIGINT` when `timeoutMs` expires. The cell
-  catches it, the runner emits the usual `cell_end` + `done` events,
-  and the namespace stays intact. State established by cells that
-  completed before the interrupt is preserved in the live kernel, so a
-  follow-up call resumes from there.
-* If the cell doesn't return within `interruptGraceMs` (default 30s,
-  configurable) the kernel is hard-killed as a last resort — this
-  catches genuinely wedged cases like a C extension that ignores
-  signals. A second SIGINT is sent halfway through the grace period
-  first — Python-level loops that swallowed the first one often act on
-  the repeat.
-* **A hard kill is not an error.** The call resolves with `killed: true`
-  and every byte the cells printed before the hang, not an exception.
-  Losing a long sweep's findings because its last HTTP call wedged is
-  worse than losing the kernel. The namespace *is* gone — the result
-  says so explicitly so the next call knows to re-run its setup.
-  Set `interruptGraceMs: 0` to disable the auto-kill entirely (rely on
-  `/python-restart` for truly wedged kernels).
-
-**Implication for long-running work**: split big jobs into multiple
-cells. State accrued in cells 0..N–1 survives a timeout in cell N,
-so a follow-up `python` call can resume from where you left off.
-
-## Settings
-
-`pi-python` reads its own JSON settings file from two locations,
-mirroring pi's own settings.json layout:
-
-```
-~/.pi/pi-python/settings.json          (global)
-<cwd>/.pi/pi-python/settings.json      (project, overrides global)
-```
-
-Both files are optional; missing fields fall back to the lower-precedence
-source. Schema:
-
-```jsonc
-{
-  // When auto-resolving the interpreter, walk from `cwd` upward looking
-  // for a venv. Stops at the first match, or at a `.git` repo root
-  // (never crosses repo boundaries). Default: true.
-  "venvParentWalk": true,
-
-  // Directory names checked at each level when auto-resolving the
-  // interpreter. A user-provided list FULLY OVERWRITES the default —
-  // setting `[".my-env"]` means *only* `.my-env` is searched, the
-  // defaults below are not appended. Set to `[]` to disable venv
-  // autodiscovery entirely. Default: [".venv", "venv"].
-  "venvDirNames": [".venv", "venv"],
-
-  // Upper bound (seconds) the `python` tool's `timeout` parameter is
-  // clamped to. Raise this if you have very long-running cells (data
-  // pulls, training, large aggregations). Default: 3600 (1 hour).
-  "maxTimeoutSeconds": 3600,
-
-  // Grace period (milliseconds) after the timeout SIGINT before the
-  // kernel is hard-killed. The runner catches SIGINT and wraps up
-  // cleanly; SIGKILL only fires if the cell is genuinely wedged
-  // (e.g. a C extension that ignores signals). Set to 0 to disable
-  // the auto-kill entirely. Default: 30000.
-  "interruptGraceMs": 30000
-}
-```
-
-Precedence (highest wins): env var → project file → global file →
-built-in default.
-
-### Environment variable overrides
-
-| Env var | Setting it overrides |
-| ------- | -------------------- |
-| `PI_PYTHON_VENV_PARENT_WALK` | `venvParentWalk` (boolean: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`) |
-| `PI_PYTHON_VENV_DIR_NAMES` | `venvDirNames` (comma-separated; an explicitly-empty value disables autodiscovery; leave the env var unset to use the default) |
-| `PI_PYTHON_MAX_TIMEOUT_SECONDS` | `maxTimeoutSeconds` (positive integer) |
-| `PI_PYTHON_INTERRUPT_GRACE_MS` | `interruptGraceMs` (non-negative integer; 0 disables auto-kill) |
-| `PI_PYTHON` | Default interpreter (same role as `--python`, lower precedence than the flag and `python_set_interpreter`) |
-
-## Interpreter resolution
-
-In order of priority:
-
-1. `python_set_interpreter` (if the agent has switched mid-session)
-2. `--python <path>` CLI flag
-3. `$PI_PYTHON` env var
-4. `$VIRTUAL_ENV/bin/python`
-5. A venv directory named in `venvDirNames` (default: `.venv`, `venv`)
-   found in `cwd`. If `venvParentWalk` is true (default), the search
-   ascends from `cwd` until a venv is found or a `.git` repo root is
-   hit — useful for uv-workspace layouts where the venv lives at the
-   workspace root, not next to every member.
-6. `python3` on `PATH`
-
-`python_set_interpreter` and the `--python` flag both accept either an
-absolute path to a binary or a bare command name on `PATH`. Directories
-are rejected with a hint pointing at the binary path inside.
-
-## Security
-
-**This extension is not a security boundary.** It exists to run
-LLM-generated code, and that code executes with your full user
-privileges: your filesystem, your network, your SSH keys, your browser
-profiles, your cloud credentials. There is no sandbox, no syscall
-filter, and no allowlist. Run it only on code and in projects you would
-be willing to run by hand.
-
-As a shallow convenience measure, API-key-shaped env vars (`OPENAI_*`,
-`ANTHROPIC_*`, `*_API_KEY`, `*_TOKEN`, `*_SECRET`, etc.) are stripped
-from the subprocess environment. This is best-effort pattern matching
-against accidental leakage into a tool result — it is trivially defeated
-by a cell that reads `~/.config`, `~/.netrc`, or any credential file, and
-it must not be relied on as a control against hostile code.
-
-## Requirements
-
-* **Node** ≥ 22.19 (matches pi core; the test script additionally needs
-  Node's `--experimental-transform-types`).
-* **Python** ≥ 3.9 for the runner. No third-party packages are required —
-  a stock interpreter is enough.
-
-## Install
+The interaction model is deliberately familiar: execute cells, inspect results,
+refine the code, and continue from the current state. The difference is that the
+agent operates the session through a tool rather than a human typing into an
+IPython prompt or notebook UI. IPython itself is not a dependency; the runner
+implements the relevant cell semantics on top of stock Python.
 
 ```bash
 pi install npm:pi-python
 ```
 
-Or pin a version, which opts out of `pi update --extensions`:
+That is the only required step. The runner uses the Python standard library and
+works with Python 3.9 or newer. The TypeScript side supports Node 22.19 or newer,
+matching pi itself, and Bun 1.3 or newer.
+
+> [!WARNING]
+> **This gives the active LLM arbitrary Python execution as your user.** The
+> model writes and invokes cells without per-cell approval and can do anything
+> that user can do. See [Security](#security).
+
+## Persistence model
+
+One pi session owns one Python process and one namespace.
+
+| Event | Namespace survives? |
+| --- | --- |
+| Another cell in the same `python` call | **Yes** |
+| A later `python` call | **Yes** |
+| An ordinary Python exception | **Yes** — mutations made before the exception remain |
+| A timeout that reaches Python as `KeyboardInterrupt` | **Yes** |
+| `/tree` navigation | **Yes** |
+| `reset: true` on a `python` call | No |
+| `/python-restart` | No |
+| `python_set_interpreter` | No |
+| Native crash or hard kill after ignored SIGINT | No |
+| Quitting pi | No |
+
+A failed cell is not a transaction: Python keeps assignments and mutations made
+before it raised. Later cells in the same call are skipped, but the next tool
+call can inspect or continue from the state that remains.
+
+## What it provides
+
+- **Notebook-style cells** — cells run in order and the `repr()` of a trailing
+  expression is displayed. A failing cell stops the cells after it.
+- **Live output** — stdout and stderr stream back while code runs.
+- **Project-aware Python selection** — discovers `.venv` and `venv`, including
+  venvs at a uv-workspace or repository root.
+- **Runtime interpreter switching** — the agent can move to another Python
+  binary when a task needs packages from a different environment.
+- **Cooperative interruption** — timeouts send SIGINT first, preserving the
+  process and namespace when Python can raise `KeyboardInterrupt`.
+- **Useful failure output** — if a genuinely wedged process must be killed, all
+  output captured before the kill is still returned.
+
+## Using it
+
+### Agent tools
+
+| Tool | Purpose |
+| --- | --- |
+| `python` | Run one or more cells in the persistent interpreter. Supports per-call timeout, namespace reset, and working-directory selection. |
+| `python_set_interpreter` | Replace the kernel with one using a specific Python executable. This intentionally starts with an empty namespace. |
+
+Two Python calls cannot run concurrently against one interpreter, so both tools
+are serialized automatically.
+
+### User commands
+
+| Command | Purpose |
+| --- | --- |
+| `/python-status` | Show the executable, Python version, process ID, cwd, liveness, and active settings with their sources. |
+| `/python-restart` | Kill and respawn the kernel with an empty namespace. Useful for a wedged process or an intentionally clean start. |
+
+Start pi with an explicit interpreter when needed:
 
 ```bash
-pi install npm:pi-python@0.2.0
+pi --python /path/to/.venv/bin/python
+pi --python python3.12
 ```
 
-To try it for a single run without installing:
+The flag is validated at startup. A bad path is reported and normal interpreter
+resolution is used instead.
 
-```bash
-pi -e npm:pi-python
+## Interpreter selection
+
+Unless explicitly overridden, pi-python selects an interpreter in this order:
+
+1. The most recent `python_set_interpreter` selection
+2. `--python <path>`
+3. `$PI_PYTHON`
+4. `$VIRTUAL_ENV/bin/python`
+5. `.venv` or `venv` in the working directory or one of its parents, stopping
+   after checking the repository root
+6. `python3` on `PATH`
+
+This makes the common case automatic: start pi anywhere inside a repository and
+its project venv is used. Both explicit selection mechanisms accept an absolute
+or relative path to an executable, or a bare command name resolvable on `PATH`.
+Directories are rejected with a hint pointing at the interpreter inside.
+
+## Timeouts and hard kills
+
+The default tool-call timeout is 120 seconds. The default ceiling is one hour,
+and `maxTimeoutSeconds` can raise it for training, large data pulls, or expensive
+analysis.
+
+When a timeout expires:
+
+1. The host sends SIGINT. During cell execution, the runner maps it to
+   `KeyboardInterrupt`; outside a cell, SIGINT is ignored so bookkeeping cannot
+   accidentally kill the process.
+2. If the cell has not returned halfway through `interruptGraceMs`, a second
+   SIGINT is sent. This catches Python loops or libraries that swallowed the
+   first one.
+3. At the end of the grace period, the process is hard-killed as a last resort.
+   This is necessary for native extensions and blocking system calls that never
+   return control to Python.
+
+A cooperative timeout keeps the namespace. A hard kill cannot, but the result is
+marked `killed` and includes every byte printed before termination. Set
+`interruptGraceMs` to `0` to disable automatic hard kills and rely on
+`/python-restart` for wedged kernels.
+
+On Windows, Node cannot deliver a catchable SIGINT to a child process. A timeout
+therefore hard-kills the kernel immediately, preserving partial output but not
+the namespace.
+
+For long work, use multiple cells: completed setup cells remain available if a
+later cell times out.
+
+## Configuration
+
+Optional settings are read from:
+
+```text
+~/.pi/pi-python/settings.json          # global
+<cwd>/.pi/pi-python/settings.json      # project, overrides global
 ```
 
-Then `/reload` inside pi (or restart). `/python-status` confirms it is
-loaded; so does the `--python <path>` flag showing up in `pi --help`,
-since this extension registers it.
+Environment variables override project settings, which override global settings,
+which override built-in defaults.
 
-### From a clone
+```jsonc
+{
+  // Search parent directories for a venv, stopping at the repo root.
+  "venvParentWalk": true,
 
-The repo doubles as the extension package, so `npm install` here pulls in
-the typings and dev tooling, and `npm run check` typechecks the TS
-files. `npm test` runs the end-to-end interrupt/timeout suite (no mocks;
-uses a real `PythonKernel`).
+  // Full replacement for the default [".venv", "venv"].
+  // Use [] to disable venv directory discovery.
+  "venvDirNames": [".venv", "venv"],
+
+  // Maximum timeout the agent may request, in seconds.
+  "maxTimeoutSeconds": 3600,
+
+  // Delay between timeout SIGINT and the final hard kill, in milliseconds.
+  // Use 0 to disable automatic hard kills.
+  "interruptGraceMs": 30000
+}
+```
+
+| Environment variable | Setting |
+| --- | --- |
+| `PI_PYTHON` | Default interpreter; below the CLI flag and runtime tool selection in precedence |
+| `PI_PYTHON_VENV_PARENT_WALK` | `venvParentWalk`; accepts `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off` |
+| `PI_PYTHON_VENV_DIR_NAMES` | `venvDirNames` as a comma-separated list; an explicitly empty value disables discovery |
+| `PI_PYTHON_MAX_TIMEOUT_SECONDS` | `maxTimeoutSeconds` as a positive integer |
+| `PI_PYTHON_INTERRUPT_GRACE_MS` | `interruptGraceMs` as a non-negative integer |
+
+`/python-status` reports the effective value and source of every setting, plus
+warnings for malformed configuration.
+
+## Security
+
+Installing pi-python delegates arbitrary Python execution to the active LLM.
+The model supplies and invokes the code without per-cell approval. There is no
+sandbox, and the Python process runs as your user with pi's environment. In
+short: the model can do anything that user can do.
+
+If that authority is too broad, isolate pi at the OS level. See
+[SECURITY.md](SECURITY.md) for the threat model and reporting policy.
+
+## How it works
+
+```text
+┌──────────────┐   NDJSON over stdio   ┌──────────────────┐
+│  pi (host)   │  ──────────────────▶  │  python3 runner  │
+│  index.ts    │  ◀──────────────────  │  runner.py       │
+│  kernel.ts   │     stream events     │  persistent ns   │
+│  settings.ts │                       └──────────────────┘
+└──────────────┘
+```
+
+- **`runner.py`** executes cells in the persistent namespace and emits framed
+  stdout, stderr, cell results, and completion events. Control messages always
+  use the original `sys.__stdout__`, so normal Python output cannot be confused
+  with protocol traffic.
+- **`kernel.ts`** owns the subprocess, parses the event stream, handles timeout
+  escalation, preserves partial output on hard kills, and respawns dead kernels.
+- **`settings.ts`** resolves global, project, and environment configuration.
+- **`index.ts`** registers the tools, slash commands, CLI flag, rendering, and
+  session lifecycle hooks.
+
+The protocol deliberately needs only a stock Python interpreter — no IPython,
+Jupyter server, or kernel gateway. The architecture is inspired by
+[oh-my-pi's IPython runtime](https://github.com/can1357/oh-my-pi/blob/main/docs/python-repl.md),
+with the gateway replaced by a small stdio protocol.
+
+## Known limitations
+
+- **Text output only** — stdout, stderr, and `repr()` of a trailing expression.
+  There are no rich `image/png` or `text/markdown` display envelopes.
+- **No interactive stdin** — `input()` is unsupported. Pass data through code,
+  variables, files, or tool parameters instead.
+- **Raw file-descriptor output bypasses capture** — child processes writing
+  directly to fd 1 are not intercepted by the `sys.stdout` wrapper.
+  `subprocess.run(..., capture_output=True)` works normally.
+- **One kernel per pi process** — kernels are not shared between separate pi
+  instances.
+- **The namespace is process-local** — quitting, restarting, switching
+  interpreters, native crashes, and hard kills discard it. Persist important
+  results explicitly when they must outlive the session.
+- **`/tree` does not rewind Python** — conversation history can move to another
+  branch while the interpreter retains everything executed before the move. Use
+  `/python-restart` when you want the process to match the visible transcript.
+
+<details>
+<summary>Why the namespace is not checkpointed to disk</summary>
+
+An earlier version pickled the whole namespace after every call so restarts and
+`/tree` navigation could restore it. The snapshots required a full serialization
+on every call and grew to 80 GB across 421 sessions. Block-level analysis found
+only 8% deduplication potential, so the growth was structural rather than a
+compression problem. Restores were rarely useful, and many Python objects cannot
+be safely serialized in the first place. Re-running setup cells is cheaper and
+more predictable.
+
+</details>
+
+## Development
 
 ```bash
+git clone git@github.com:Luminger/pi-python.git
+cd pi-python
 npm install
 npm run check
-npm test
+npm test          # Node host
+npm run test:bun  # Bun host
 ```
 
-For pi to pick a clone up, place the directory under one of pi's
-auto-discovery roots:
+The test suite drives real Python subprocesses and real signals; it does not mock
+the behavior it is meant to verify.
 
-```bash
-# global (all projects)
-ln -s "$(pwd)" ~/.pi/agent/extensions/pi-python
-
-# or project-local
-mkdir -p .pi/extensions
-ln -s "$(pwd)" .pi/extensions/pi-python
-```
-
-For one-off testing of a clone:
+Run the checkout directly for one session:
 
 ```bash
 pi -e ./index.ts
 ```
 
-## Tool reference
+Or install the checkout as a local pi package:
 
-### `python`
-
-```ts
-{
-  cells: Array<{ code: string; title?: string }>;  // ≥1
-  timeout?: number;   // seconds, default 120, clamped to 1..maxTimeoutSeconds (3600)
-  reset?: boolean;    // drop the namespace before the first cell
-  cwd?: string;       // working dir for this call
-}
+```bash
+pi install .
 ```
 
-Result includes per-cell stdout, stderr, last-expression value (when the
-cell ends in a bare expression), and a formatted traceback for failures.
-Output is truncated with `truncateTail` (50 KB / 2000 lines) so the LLM
-sees the most recent output when runs are noisy.
-
-### `python_set_interpreter`
-
-```ts
-{
-  path: string;       // absolute path or bare PATH command name
-}
-```
-
-Validates the path, kills the current kernel, spawns a new one with the
-requested interpreter, and reports the resolved executable, version, and
-new pid. Throws (with the validation error) if the path doesn't point at
-a runnable interpreter.
-
-## Known limitations
-
-* **No rich display** — only text stdout/stderr and `repr()` of trailing
-  expressions. No `image/png` / `text/markdown` envelopes (yet).
-* **`input()` is not supported** — there is no interactive stdin. Pass
-  data through variables instead.
-* **`subprocess` output via raw fd 1** — `subprocess.run(...,
-  capture_output=True)` works, but child processes that write directly
-  to fd 1 bypass our `sys.stdout` shadowing.
-* **One kernel per pi process** — no shared gateway across multiple pi
-  instances. If you need that, the next step is binding the kernel to a
-  Unix socket per session file.
-* **The namespace dies with the kernel.** `/python-restart`,
-  `python_set_interpreter`, a hard kill after an ignored SIGINT, and
-  quitting pi all discard it. This is a deliberate trade against the old
-  on-disk checkpointing; if you need state to outlive the process, write
-  it to a file from inside a cell.
-* **`/tree` navigation does not touch the kernel.** Time travel rewinds
-  the conversation, not the interpreter — variables stay exactly as the
-  cells left them, so the namespace can legitimately contain things the
-  visible history hasn't produced yet. Use `/python-restart` when you
-  want the interpreter to match the rewound transcript.
-
-## Versioning and releases
-
-`0.x`, and staying there. Nothing here is a stability promise — tool
-names, parameters, result formatting, and defaults change whenever a
-better shape turns up.
-
-The agent-facing surface is the *cheapest* part to change, not the most
-expensive. The model re-reads the tool schema every session; rename
-`cells` to `blocks` tomorrow and it simply adapts. Nobody has code
-calling this by hand, so treating tool signatures as an API contract
-would be cargo-culting semver at a consumer that doesn't need it.
-
-What actually warrants a `!` / `BREAKING CHANGE:` trailer is anything
-that silently breaks a working install:
-
-* `settings.json` keys and `PI_PYTHON_*` env vars being renamed or dropped
-* a change in interpreter resolution order, so a different python gets picked
-* raising the Node or Python floor
-* a change to whether the namespace survives some event
-
-Version numbers exist so `pi update --extensions` has something to
-compare, and so a bad release can be pinned around. Releases are
-generated from [Conventional
-Commits](https://www.conventionalcommits.org/en/v1.0.0/) by
-release-please and published to npm from CI with trusted publishing, so
-each one carries provenance. See [CONTRIBUTING.md](CONTRIBUTING.md) and
-[CHANGELOG.md](CHANGELOG.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, branch protection,
+and the release process. See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-The architecture is borrowed in spirit from
-[oh-my-pi's IPython kernel runtime](https://github.com/can1357/oh-my-pi/blob/main/docs/python-repl.md),
-with the heavy Jupyter Kernel Gateway replaced by a stdio NDJSON protocol
-so this works with a stock Python install. (oh-my-pi's runtime offers an
-interactive REPL too; pi-python intentionally does not.)
