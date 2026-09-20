@@ -2,16 +2,15 @@
  * pi-python settings.
  *
  * pi's built-in `Settings` schema is strongly typed and has no slot for
- * arbitrary extension config, so we keep our own JSON file. The global file
- * lives next to pi's other user extensions, the project file mirrors pi's
- * project layout:
+ * arbitrary extension config, so we keep our own JSON file under pi's global
+ * and project config roots:
  *
- *   ${PI_CODING_AGENT_DIR}/extensions/pi-python/settings.json  (global)
- *   <cwd>/.pi/pi-python/settings.json                          (project, overrides global)
+ *   ${PI_CODING_AGENT_DIR}/pi-python/settings.json  (global)
+ *   <cwd>/${CONFIG_DIR_NAME}/pi-python/settings.json (project, overrides global)
  *
- * `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent` when unset. The pre-
- * `extensions/` location (`~/.pi/pi-python/settings.json`) is migrated once,
- * on load, when it exists and the new file does not.
+ * `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`; `CONFIG_DIR_NAME` defaults
+ * to `.pi`. The old global location (`~/.pi/pi-python/settings.json`) is
+ * migrated once, on load, when it exists and the new file does not.
  *
  * Both files are optional. Missing fields fall back to the lower-precedence
  * source. Malformed JSON is ignored (a warning surfaces in /python-status)
@@ -31,13 +30,13 @@
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 /** Agent config dir — respects PI_CODING_AGENT_DIR, defaults to ~/.pi/agent. */
 export const AGENT_DIR = getAgentDir();
 
-/** Global settings live alongside the installed pi-python extension. */
-export const PI_PYTHON_DIR = join(AGENT_DIR, "extensions", "pi-python");
+/** Global settings live under pi's config root, never inside extension code. */
+export const PI_PYTHON_DIR = join(AGENT_DIR, "pi-python");
 export const GLOBAL_SETTINGS_FILE = join(PI_PYTHON_DIR, "settings.json");
 
 /** Pre-`extensions/` location, moved to GLOBAL_SETTINGS_FILE on first load. */
@@ -45,7 +44,7 @@ export const LEGACY_GLOBAL_SETTINGS_FILE = join(homedir(), ".pi", "pi-python", "
 
 /** Where the project settings file lives, given a working directory. */
 export function projectSettingsFileFor(cwd: string): string {
-	return join(cwd, ".pi", "pi-python", "settings.json");
+	return join(cwd, CONFIG_DIR_NAME, "pi-python", "settings.json");
 }
 
 export interface PiPythonSettings {
@@ -117,11 +116,9 @@ export interface ResolvedSettings {
 	values: PiPythonSettings;
 	sources: SettingsSources;
 	/**
-	 * Where each settings file was looked up — for /python-status. `legacy`
-	 * is only present once the old location has been migrated (or failed to
-	 * migrate) so status can explain the transition.
+	 * Where each settings file was looked up — for /python-status.
 	 */
-	paths: { global: string; project: string | null; legacy?: string | null };
+	paths: { global: string; project: string | null };
 	/** Errors encountered while loading; surfaced in /python-status, never thrown. */
 	warnings: string[];
 }
@@ -131,7 +128,7 @@ export interface ResolvedSettings {
  *
  * No caching, safe to call repeatedly. Cost is two stats + up to two parses.
  * Side effect: the first call after an upgrade may move the legacy global
- * file into the extensions directory (best-effort, warning on failure).
+ * file under pi's agent config directory (best-effort, warning on failure).
  */
 export function loadSettings(opts?: {
 	cwd?: string;
@@ -228,29 +225,30 @@ export function loadSettings(opts?: {
 			// Point /python-status at whichever file is actually effective.
 			global: legacyUsed ? LEGACY_GLOBAL_SETTINGS_FILE : GLOBAL_SETTINGS_FILE,
 			project: projectFile,
-			legacy: legacyPresent ? LEGACY_GLOBAL_SETTINGS_FILE : null,
 		},
 		warnings,
 	};
 }
 
 /**
- * Move ~/.pi/pi-python/settings.json into the extensions directory when the
- * old file exists and the new one does not. Best-effort: any failure is a
+ * Move ~/.pi/pi-python/settings.json under pi's agent config directory when
+ * the old file exists and the new one does not. Best-effort: any failure is a
  * warning, never fatal. Returns whether the legacy file was present.
  */
-function migrateLegacyGlobalSettings(warnings: string[]): boolean {
-	if (!existsSync(LEGACY_GLOBAL_SETTINGS_FILE)) return false;
-	if (existsSync(GLOBAL_SETTINGS_FILE)) return true;
+export function migrateLegacyGlobalSettings(
+	warnings: string[],
+	legacyFile = LEGACY_GLOBAL_SETTINGS_FILE,
+	globalFile = GLOBAL_SETTINGS_FILE,
+): boolean {
+	if (!existsSync(legacyFile)) return false;
+	if (existsSync(globalFile)) return true;
 	try {
-		mkdirSync(dirname(GLOBAL_SETTINGS_FILE), { recursive: true });
-		renameSync(LEGACY_GLOBAL_SETTINGS_FILE, GLOBAL_SETTINGS_FILE);
-		warnings.push(
-			`migrated settings: ${LEGACY_GLOBAL_SETTINGS_FILE} -> ${GLOBAL_SETTINGS_FILE}`,
-		);
+		mkdirSync(dirname(globalFile), { recursive: true });
+		renameSync(legacyFile, globalFile);
+		warnings.push(`migrated settings: ${legacyFile} -> ${globalFile}`);
 	} catch (err) {
 		warnings.push(
-			`could not move ${LEGACY_GLOBAL_SETTINGS_FILE} to ${GLOBAL_SETTINGS_FILE} ` +
+			`could not move ${legacyFile} to ${globalFile} ` +
 				`(${err instanceof Error ? err.message : String(err)}); still reading the legacy location`,
 		);
 	}

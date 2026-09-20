@@ -43,8 +43,8 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --no-warnings test-interrupt.ts",
-    "test:bun": "bun test-interrupt.ts"
+    "test": "node --no-warnings test-settings.ts && node --no-warnings test-interrupt.ts",
+    "test:bun": "bun test-settings.ts && bun test-interrupt.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

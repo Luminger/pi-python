@@ -150,9 +150,15 @@ later cell times out.
 Optional settings are read from:
 
 ```text
-~/.pi/pi-python/settings.json          # global
-<cwd>/.pi/pi-python/settings.json      # project, overrides global
+${PI_CODING_AGENT_DIR}/pi-python/settings.json       # global
+<cwd>/${CONFIG_DIR_NAME}/pi-python/settings.json     # project, overrides global
 ```
+
+`PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`; `CONFIG_DIR_NAME` defaults to
+`.pi`. On upgrade, an existing `~/.pi/pi-python/settings.json` is moved to the
+new global location when that location does not already exist. Migration failure
+is non-fatal: the old file remains effective and `/python-status` reports a
+warning.
 
 Environment variables override project settings, which override global settings,
 which override built-in defaults.
