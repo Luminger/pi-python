@@ -1,6 +1,6 @@
 {
   "name": "pi-python",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "Persistent IPython-style Python session for the pi coding agent",
   "license": "MIT",

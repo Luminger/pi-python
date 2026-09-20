@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.2](https://github.com/Luminger/pi-python/compare/v0.3.1...v0.3.2) (2026-09-20)
+
+
+### Features
+
+* honor pi agent config directories for settings ([#4](https://github.com/Luminger/pi-python/issues/4)) ([eaad718](https://github.com/Luminger/pi-python/commit/eaad71827765f0875692cd00fe1fbac6f8678fe6))
+* make persistent Python the default agent path ([#3](https://github.com/Luminger/pi-python/issues/3)) ([b47e2b0](https://github.com/Luminger/pi-python/commit/b47e2b02ad9d55cf2b38f600410bf49a1db8c157))
+
 ## [0.3.1](https://github.com/Luminger/pi-python/compare/v0.3.0...v0.3.1) (2026-09-17)
 
 
