@@ -207,7 +207,7 @@ async function main(): Promise<void> {
 	//
 	// Regression test for the only failure mode that ever showed up in real
 	// sessions: a cell wedged in something SIGINT can't reach (here, a
-	// Python-level handler that swallows every KeyboardInterrupt, standing
+	// Python-level SIGINT handler that swallows every interrupt, standing
 	// in for a C extension). It used to reject the whole call with the bare
 	// string "python kernel killed", discarding everything the cell had
 	// printed. It must now resolve with that output plus killed=true.
@@ -220,14 +220,17 @@ async function main(): Promise<void> {
 			[
 				{
 					code: [
-						"import time, sys",
+						"import signal, time",
+						// A no-op handler swallows every SIGINT wherever it lands. A
+						// try/except around the sleep did not: a SIGINT arriving on
+						// the loop condition escaped as KeyboardInterrupt, the cell
+						// ended on its own, and the hard kill never happened (seen on
+						// macOS + Python 3.14 in CI).
+						"signal.signal(signal.SIGINT, lambda *_: None)  # like a C ext that never checks signals",
 						"print('findings: 3 hosts reachable', flush=True)",
 						"deadline = time.time() + 30",
 						"while time.time() < deadline:",
-						"    try:",
-						"        time.sleep(0.05)",
-						"    except KeyboardInterrupt:",
-						"        pass  # swallow it, like a C ext that never checks signals",
+						"    time.sleep(0.05)",
 					].join("\n"),
 				},
 			],
