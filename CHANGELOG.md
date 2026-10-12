@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/Luminger/pi-python/compare/v0.3.2...v0.3.3) (2026-10-12)
+
+
+### Features
+
+* contain kernel memory with a systemd scope, a warning and an OOM score ([90b8804](https://github.com/Luminger/pi-python/commit/90b880413fd1a5f12e5f82457f5f43eb30d647a3))
+
 ## [0.3.2](https://github.com/Luminger/pi-python/compare/v0.3.1...v0.3.2) (2026-09-20)
 
 
