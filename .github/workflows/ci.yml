@@ -21,9 +21,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The three hosted OS families, all on x64 so Python 3.9 is available
-        # (macos-latest is arm64 and has no Python 3.9 build).
-        os: [ubuntu-latest, macos-26-intel, windows-latest]
+        # The three hosted OS families. macOS runs on Apple Silicon: GitHub
+        # ends x86_64 macOS runners after August 2027. setup-python's newest
+        # darwin-arm64 builds are 3.9.13 and 3.10.11 for the two oldest lines,
+        # which "3.9"/"3.10" resolve to. Pinned rather than macos-latest so an
+        # image bump is a deliberate change.
+        os: [ubuntu-latest, macos-26, windows-latest]
         runtime:
           # Node 22.19 is pi's minimum, 22.x is the current maintenance patch,
           # 24.x is Active LTS, and 26.x is Current.
