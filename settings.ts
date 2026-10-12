@@ -94,6 +94,35 @@ export interface PiPythonSettings {
 	 * Default: 30000 (30 seconds).
 	 */
 	interruptGraceMs: number;
+	/**
+	 * Kernel memory (MB) above which every `python` result carries a warning
+	 * telling the agent to free memory or restart the kernel. Measured as the
+	 * kernel's cgroup `memory.current` when it runs in its own scope (see
+	 * `memoryMaxMB`), else its RSS. 0 disables the warning.
+	 *
+	 * Default: 1024.
+	 */
+	memoryWarnMB: number;
+	/**
+	 * Hard memory limit (MB) for the kernel. On Linux with a systemd user
+	 * manager the kernel is started in its own transient scope
+	 * (`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`), so a
+	 * runaway kernel is OOM-killed on its own instead of dragging the whole
+	 * machine into a global OOM. Elsewhere it is started directly and the limit
+	 * is not enforced (/python-status says so). 0 disables the limit.
+	 *
+	 * Default: 4096.
+	 */
+	memoryMaxMB: number;
+	/**
+	 * `oom_score_adj` for the kernel (and children it starts), so that under
+	 * global memory pressure the kernel is picked before longer-lived services.
+	 * Raising the value needs no privilege; lowering it below the parent's does
+	 * and is not attempted. Range 0..1000; 0 leaves it unchanged.
+	 *
+	 * Default: 500.
+	 */
+	oomScoreAdj: number;
 }
 
 export const DEFAULT_SETTINGS: PiPythonSettings = {
@@ -101,6 +130,9 @@ export const DEFAULT_SETTINGS: PiPythonSettings = {
 	venvDirNames: [".venv", "venv"],
 	maxTimeoutSeconds: 3600,
 	interruptGraceMs: 30_000,
+	memoryWarnMB: 1024,
+	memoryMaxMB: 4096,
+	oomScoreAdj: 500,
 };
 
 export type SettingSource = "default" | "global" | "project" | "env";
@@ -110,6 +142,9 @@ export interface SettingsSources {
 	venvDirNames: SettingSource;
 	maxTimeoutSeconds: SettingSource;
 	interruptGraceMs: SettingSource;
+	memoryWarnMB: SettingSource;
+	memoryMaxMB: SettingSource;
+	oomScoreAdj: SettingSource;
 }
 
 export interface ResolvedSettings {
@@ -148,6 +183,9 @@ export function loadSettings(opts?: {
 		venvDirNames: "default",
 		maxTimeoutSeconds: "default",
 		interruptGraceMs: "default",
+		memoryWarnMB: "default",
+		memoryMaxMB: "default",
+		oomScoreAdj: "default",
 	};
 	const warnings: string[] = [];
 	const projectFile = cwd ? projectSettingsFileFor(cwd) : null;
@@ -218,6 +256,18 @@ export function loadSettings(opts?: {
 		}
 	}
 
+	for (const [key, name, max] of INTEGER_ENV) {
+		const raw = env[name];
+		if (raw === undefined || raw === "") continue;
+		const parsed = parseNonNegativeInteger(raw);
+		if (parsed !== null && parsed <= max) {
+			values[key] = parsed;
+			sources[key] = "env";
+		} else {
+			warnings.push(`${name}=${JSON.stringify(raw)} is not an integer in 0..${max}`);
+		}
+	}
+
 	return {
 		values,
 		sources,
@@ -229,6 +279,13 @@ export function loadSettings(opts?: {
 		warnings,
 	};
 }
+
+/** Non-negative integer settings that share one parser: key, env var, upper bound. */
+const INTEGER_ENV: ReadonlyArray<readonly ["memoryWarnMB" | "memoryMaxMB" | "oomScoreAdj", string, number]> = [
+	["memoryWarnMB", "PI_PYTHON_MEMORY_WARN_MB", Number.MAX_SAFE_INTEGER],
+	["memoryMaxMB", "PI_PYTHON_MEMORY_MAX_MB", Number.MAX_SAFE_INTEGER],
+	["oomScoreAdj", "PI_PYTHON_OOM_SCORE_ADJ", 1000],
+];
 
 /**
  * Move ~/.pi/pi-python/settings.json under pi's agent config directory when
@@ -335,6 +392,18 @@ function applyFile(
 		warnings.push(
 			`${source} settings (${path}): interruptGraceMs must be a non-negative number, got ${JSON.stringify(fileGrace)}`,
 		);
+	}
+
+	for (const [key, , max] of INTEGER_ENV) {
+		const v = obj[key];
+		if (typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= max) {
+			values[key] = Math.floor(v);
+			sources[key] = source;
+		} else if (v !== undefined) {
+			warnings.push(
+				`${source} settings (${path}): ${key} must be a number in 0..${max}, got ${JSON.stringify(v)}`,
+			);
+		}
 	}
 }
 

@@ -4,7 +4,7 @@
  */
 
 import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,6 +51,53 @@ export interface KernelOptions {
 	pythonPath: string;
 	cwd: string;
 	env?: NodeJS.ProcessEnv;
+	/** Memory containment; see `memoryMaxMB` / `oomScoreAdj` in settings.ts. */
+	memory?: { maxMB: number; oomScoreAdj: number };
+}
+
+export interface KernelMemory {
+	/** Bytes in use: the scope's cgroup `memory.current`, or the process RSS. */
+	bytes: number;
+	source: "cgroup" | "rss";
+}
+
+/** How the memory limit is applied to the running kernel. */
+export interface KernelLimit {
+	maxMB: number;
+	/** Name of the transient systemd scope, or null when the limit is not enforced. */
+	scope: string | null;
+	/** Why the limit is not enforced, when it is not. */
+	unenforcedReason?: string;
+}
+
+let scopeProbe: { ok: boolean; reason?: string } | null = null;
+
+/**
+ * Can this process start kernels in a memory-limited systemd user scope?
+ * Probed once per pi process by running `true` in a throwaway scope.
+ */
+export function systemdScopeAvailable(): { ok: boolean; reason?: string } {
+	if (scopeProbe) return scopeProbe;
+	if (process.platform !== "linux") {
+		scopeProbe = { ok: false, reason: `not Linux (${process.platform})` };
+		return scopeProbe;
+	}
+	const r = spawnSync(
+		"systemd-run",
+		["--user", "--scope", "--quiet", "--collect", "-p", "MemoryMax=64M", "-p", "MemorySwapMax=0", "--", "true"],
+		{ timeout: 10_000, stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" },
+	);
+	if (r.error) scopeProbe = { ok: false, reason: `systemd-run unavailable (${r.error.message})` };
+	else if (r.status !== 0)
+		scopeProbe = { ok: false, reason: `systemd-run --user --scope failed: ${(r.stderr || "").trim().split("\n")[0]}` };
+	else scopeProbe = { ok: true };
+	return scopeProbe;
+}
+
+/** Bytes for an RSS/cgroup reading, as a short human string. */
+export function formatBytes(bytes: number): string {
+	if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(1)} GB`;
+	return `${Math.round(bytes / (1 << 20))} MB`;
 }
 
 interface PendingRequest {
@@ -84,6 +131,7 @@ export class PythonKernel {
 	private readyReject: ((err: Error) => void) | null = null;
 	private exitReason: string | null = null;
 	private nextRequestId = 1;
+	private limit: KernelLimit | null = null;
 
 	constructor(options: KernelOptions) {
 		this.options = options;
@@ -103,6 +151,41 @@ export class PythonKernel {
 		return this.proc.exitCode === null && this.proc.signalCode === null;
 	}
 
+	/** The memory limit applied to this kernel, or null when none was requested. */
+	getLimit(): KernelLimit | null {
+		return this.limit;
+	}
+
+	/**
+	 * Current memory use. For a scoped kernel this is the scope's cgroup
+	 * `memory.current`, which counts child processes and is what MemoryMax is
+	 * enforced against; otherwise the kernel process's RSS. Null when unknown.
+	 */
+	memoryUsage(): KernelMemory | null {
+		const pid = this.proc?.pid;
+		if (pid === undefined || !this.isAlive()) return null;
+		if (this.limit?.scope) {
+			try {
+				const line = readFileSync(`/proc/${pid}/cgroup`, "utf8")
+					.split("\n")
+					.find((l) => l.startsWith("0::"));
+				if (line) {
+					const bytes = Number(readFileSync(`/sys/fs/cgroup${line.slice(3)}/memory.current`, "utf8").trim());
+					if (Number.isFinite(bytes)) return { bytes, source: "cgroup" };
+				}
+			} catch {
+				// fall back to RSS
+			}
+		}
+		try {
+			const m = /^VmRSS:\s+(\d+) kB/m.exec(readFileSync(`/proc/${pid}/status`, "utf8"));
+			if (m) return { bytes: Number(m[1]) * 1024, source: "rss" };
+		} catch {
+			// not Linux, or the process just exited
+		}
+		return null;
+	}
+
 	/** Lazily spawn and wait for the runner's `ready` event. */
 	async start(): Promise<KernelInfo> {
 		if (this.readyInfo) return this.readyInfo;
@@ -113,11 +196,47 @@ export class PythonKernel {
 		// exactly as they do from the user's shell.
 		const env = { ...(this.options.env ?? process.env), PYTHONUNBUFFERED: "1" };
 
-		const proc = spawn(this.options.pythonPath, ["-u", RUNNER_PATH], {
+		// Memory containment. The kernel runs in its own transient systemd scope
+		// with a hard MemoryMax, so a runaway cell (or an in-process JVM that
+		// grew to a quarter of RAM) is OOM-killed on its own rather than pushing
+		// the whole machine into a global OOM that picks an arbitrary victim.
+		// `systemd-run --scope` execs the command in place: same PID, same stdio,
+		// so signals and the wire protocol are unaffected.
+		let command = this.options.pythonPath;
+		let args = ["-u", RUNNER_PATH];
+		const mem = this.options.memory;
+		this.limit = null;
+		if (mem && mem.maxMB > 0) {
+			const probe = systemdScopeAvailable();
+			if (probe.ok) {
+				const scope = `pi-python-${process.pid}-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+				args = [
+					"--user",
+					"--scope",
+					"--quiet",
+					"--collect",
+					`--unit=${scope}`,
+					"-p",
+					`MemoryMax=${mem.maxMB}M`,
+					"-p",
+					"MemorySwapMax=0",
+					"--",
+					command,
+					...args,
+				];
+				command = "systemd-run";
+				this.limit = { maxMB: mem.maxMB, scope };
+			} else {
+				this.limit = { maxMB: mem.maxMB, scope: null, unenforcedReason: probe.reason };
+			}
+		}
+
+		const proc = spawn(command, args, {
 			cwd: this.options.cwd,
 			env,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
+		if (mem && mem.oomScoreAdj > 0 && proc.pid !== undefined) raiseOomScore(proc.pid, mem.oomScoreAdj);
 
 		this.proc = proc;
 		this.readyPromise = new Promise<KernelInfo>((resolveReady, rejectReady) => {
@@ -152,7 +271,15 @@ export class PythonKernel {
 		});
 		proc.on("exit", (code, signal) => {
 			if (!isCurrent()) return;
-			const reason = signal ? `signal ${signal}` : `exit code ${code}`;
+			let reason = signal ? `signal ${signal}` : `exit code ${code}`;
+			// Our own kill() detaches the process first (isCurrent() is false by
+			// then), so a SIGKILL seen here came from outside: in a scoped kernel
+			// that is almost always the memory limit.
+			if (signal === "SIGKILL" && this.limit?.scope) {
+				reason +=
+					` — most likely the ${this.limit.maxMB} MB kernel memory limit (pi-python memoryMaxMB); ` +
+					"the namespace is gone. Keep less in memory (stream to files, del + gc.collect()) and rerun.";
+			}
 			this.exitReason = reason;
 			this.fail(new Error(`Python kernel exited (${reason})`));
 		});
@@ -682,5 +809,21 @@ export function verifyInterpreterRuns(
 			version: "",
 			error: err instanceof Error ? err.message : String(err),
 		};
+	}
+}
+
+/**
+ * Raise a process's `oom_score_adj` so the kernel OOM killer prefers it over
+ * longer-lived services. Raising needs no privilege; a value at or below the
+ * current one is left alone (lowering would need CAP_SYS_RESOURCE).
+ * Best-effort: any failure leaves the default in place.
+ */
+function raiseOomScore(pid: number, value: number): void {
+	const path = `/proc/${pid}/oom_score_adj`;
+	try {
+		const current = Number(readFileSync(path, "utf8").trim());
+		if (Number.isFinite(current) && value > current) writeFileSync(path, String(value));
+	} catch {
+		// not Linux, or the process is already gone
 	}
 }

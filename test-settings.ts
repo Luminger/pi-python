@@ -86,6 +86,26 @@ try {
 	check(existing.values.maxTimeoutSeconds === 41, "new global file wins");
 	check(existsSync(legacy), "legacy file remains when destination already exists");
 	check(JSON.parse(readFileSync(global, "utf8")).maxTimeoutSeconds === 41, "destination was not modified");
+
+	console.log("\n[4] memory settings");
+	const defaults = settings.loadSettings({ cwd: undefined, env: {} });
+	check(defaults.values.memoryWarnMB === 1024, "memoryWarnMB defaults to 1024");
+	check(defaults.values.memoryMaxMB === 4096, "memoryMaxMB defaults to 4096");
+	check(defaults.values.oomScoreAdj === 500, "oomScoreAdj defaults to 500");
+	writeFileSync(global, JSON.stringify({ memoryMaxMB: 2048, memoryWarnMB: 0, oomScoreAdj: 2000 }));
+	const fromFile = settings.loadSettings({ cwd: undefined, env: {} });
+	check(fromFile.values.memoryMaxMB === 2048 && fromFile.sources.memoryMaxMB === "global", "memoryMaxMB from file");
+	check(fromFile.values.memoryWarnMB === 0, "memoryWarnMB 0 disables the warning");
+	check(
+		fromFile.values.oomScoreAdj === 500 && fromFile.warnings.some((w: string) => w.includes("oomScoreAdj")),
+		"out-of-range oomScoreAdj is rejected with a warning",
+	);
+	const fromEnv = settings.loadSettings({
+		cwd: undefined,
+		env: { PI_PYTHON_MEMORY_MAX_MB: "8192", PI_PYTHON_MEMORY_WARN_MB: "lots" },
+	});
+	check(fromEnv.values.memoryMaxMB === 8192 && fromEnv.sources.memoryMaxMB === "env", "env beats file");
+	check(fromEnv.warnings.some((w: string) => w.includes("PI_PYTHON_MEMORY_WARN_MB")), "bad env value warns");
 } finally {
 	for (const [key, value] of Object.entries(previous)) {
 		if (value === undefined) delete process.env[key];

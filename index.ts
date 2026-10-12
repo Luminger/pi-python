@@ -45,6 +45,7 @@ import { Type } from "typebox";
 import {
 	type CellRequest,
 	type ExecuteResult,
+	formatBytes,
 	PythonKernel,
 	resolvePythonPath,
 	validateInterpreterPath,
@@ -89,7 +90,11 @@ export default function pythonExtension(pi: ExtensionAPI) {
 			walkParents: settings.venvParentWalk,
 			venvDirNames: settings.venvDirNames,
 		});
-		const next = new PythonKernel({ pythonPath, cwd });
+		const next = new PythonKernel({
+			pythonPath,
+			cwd,
+			memory: { maxMB: settings.memoryMaxMB, oomScoreAdj: settings.oomScoreAdj },
+		});
 		await next.start();
 		kernel = next;
 		return next;
@@ -283,8 +288,19 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				},
 			});
 
-			const text = formatExecuteResult(cells, result, false);
+			let text = formatExecuteResult(cells, result, false);
 			const info = k.getInfo();
+			const memory = k.memoryUsage();
+			const warnMB = callSettings.memoryWarnMB;
+			if (memory && warnMB > 0 && memory.bytes > warnMB * 1024 * 1024) {
+				const limit = k.getLimit();
+				const cap = limit?.scope ? `; hard limit ${limit.maxMB} MB, at which the kernel is killed` : "";
+				text +=
+					`\n\n[memory warning: this kernel uses ${formatBytes(memory.bytes)} ` +
+					`(warning above ${warnMB} MB${cap}). Free what you no longer need ` +
+					"(del large objects, gc.collect(); for an in-process JVM also java.lang.System.gc()), " +
+					"or persist state and restart the kernel with reset.]";
+			}
 			return {
 				content: [{ type: "text", text }],
 				details: {
@@ -297,6 +313,7 @@ export default function pythonExtension(pi: ExtensionAPI) {
 					python: info?.python,
 					executable: info?.executable,
 					pid: info?.pid,
+					memoryBytes: memory?.bytes,
 					cwd,
 				},
 			};
@@ -392,6 +409,11 @@ export default function pythonExtension(pi: ExtensionAPI) {
 					lines.push(`  pid:        ${info.pid}`);
 					lines.push(`  cwd:        ${info.cwd}`);
 					lines.push(`  alive:      ${kernel.isAlive() ? "yes" : "no"}`);
+					const memory = kernel.memoryUsage();
+					if (memory) lines.push(`  memory:     ${formatBytes(memory.bytes)} (${memory.source})`);
+					const limit = kernel.getLimit();
+					if (limit?.scope) lines.push(`  limit:      ${limit.maxMB} MB (systemd scope ${limit.scope})`);
+					else if (limit) lines.push(`  limit:      ${limit.maxMB} MB NOT enforced: ${limit.unenforcedReason}`);
 				} else {
 					lines.push("  starting...");
 				}
@@ -417,6 +439,13 @@ export default function pythonExtension(pi: ExtensionAPI) {
 				`  interruptGraceMs:  ${settings.interruptGraceMs}ms ` +
 					`(source: ${sources.interruptGraceMs})`,
 			);
+			lines.push(
+				`  memoryWarnMB:      ${settings.memoryWarnMB} (source: ${sources.memoryWarnMB})`,
+			);
+			lines.push(
+				`  memoryMaxMB:       ${settings.memoryMaxMB} (source: ${sources.memoryMaxMB})`,
+			);
+			lines.push(`  oomScoreAdj:       ${settings.oomScoreAdj} (source: ${sources.oomScoreAdj})`);
 			for (const w of warnings) lines.push(`  warning: ${w}`);
 
 			ctx.ui.notify(lines.join("\n"), "info");

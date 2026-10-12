@@ -177,7 +177,17 @@ which override built-in defaults.
 
   // Delay between timeout SIGINT and the final hard kill, in milliseconds.
   // Use 0 to disable automatic hard kills.
-  "interruptGraceMs": 30000
+  "interruptGraceMs": 30000,
+
+  // Add a memory warning to every result while the kernel uses more than this
+  // many MB. 0 disables the warning.
+  "memoryWarnMB": 1024,
+
+  // Hard memory limit for the kernel, in MB (see "Memory" below). 0 disables it.
+  "memoryMaxMB": 4096,
+
+  // Raise the kernel's oom_score_adj to this value (0..1000). 0 leaves it alone.
+  "oomScoreAdj": 500
 }
 ```
 
@@ -188,9 +198,44 @@ which override built-in defaults.
 | `PI_PYTHON_VENV_DIR_NAMES` | `venvDirNames` as a comma-separated list; an explicitly empty value disables discovery |
 | `PI_PYTHON_MAX_TIMEOUT_SECONDS` | `maxTimeoutSeconds` as a positive integer |
 | `PI_PYTHON_INTERRUPT_GRACE_MS` | `interruptGraceMs` as a non-negative integer |
+| `PI_PYTHON_MEMORY_WARN_MB` | `memoryWarnMB` as a non-negative integer |
+| `PI_PYTHON_MEMORY_MAX_MB` | `memoryMaxMB` as a non-negative integer |
+| `PI_PYTHON_OOM_SCORE_ADJ` | `oomScoreAdj` as an integer in 0..1000 |
 
 `/python-status` reports the effective value and source of every setting, plus
 warnings for malformed configuration.
+
+### Memory
+
+On Linux with a systemd user manager, each kernel starts in its own transient
+scope:
+
+```text
+systemd-run --user --scope -p MemoryMax=<memoryMaxMB>M -p MemorySwapMax=0 -- python -u runner.py
+```
+
+The scope keeps the kernel's PID and stdio. When the kernel and the processes
+it starts exceed `memoryMaxMB`, the kernel is killed on its own. The rest of the
+machine never reaches a global out-of-memory condition. The tool reports the
+kill as a SIGKILL caused by the memory limit. The namespace is lost, and the
+next call starts a fresh kernel.
+
+While the kernel uses more than `memoryWarnMB`, every `python` result ends with
+a warning. The warning tells the model how much memory the kernel uses and how
+to free it. Use is the scope's `memory.current`, or the kernel's RSS when
+the kernel has no scope.
+
+Without systemd (macOS, Windows, containers without a user manager), the kernel
+starts directly. In that case `/python-status` shows that the limit is not
+enforced, and the warning still works on Linux.
+
+The kernel's `oom_score_adj` is raised to `oomScoreAdj`, so under global
+memory pressure the kernel is killed before longer-lived services. An
+unprivileged process can raise its own score but not lower it.
+
+A library that embeds another runtime counts against the same limit. For
+example, a JVM started through JPype runs inside the kernel. Give such a
+runtime its own heap ceiling below `memoryMaxMB`.
 
 ## Security
 
